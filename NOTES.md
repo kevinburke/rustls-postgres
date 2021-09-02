@@ -7,6 +7,9 @@ patterns for crustls as the third TLS library in use.
 
 https://postgrespro.com/list/thread-id/2492594#1538bd8894fc723d97d5c41b9d4bb8feb9db0d43.camel@j-davis.com
 
+For ease of looking at the diff I've opened the most recent patch set as a PR
+which you can view here. https://github.com/kevinburke/postgres/pull/2
+
 ### Server side
 
 #### Functions that need to be implemented
