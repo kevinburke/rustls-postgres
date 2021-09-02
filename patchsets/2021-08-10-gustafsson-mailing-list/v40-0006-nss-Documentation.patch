@@ -1,0 +1,853 @@
+From 760ba3bf701d8a3a0da6507930ce6e7ef1792803 Mon Sep 17 00:00:00 2001
+From: Daniel Gustafsson <daniel@yesql.se>
+Date: Mon, 8 Feb 2021 23:52:42 +0100
+Subject: [PATCH v40 06/10] nss: Documentation
+
+Basic documentation of the new API (keypass hooks) as well as config
+parameters and installation. Additionally there is a section on how
+to create certificate and keys using the NSS toolchain.
+---
+ doc/src/sgml/acronyms.sgml     |  33 ++++
+ doc/src/sgml/config.sgml       |  30 ++-
+ doc/src/sgml/installation.sgml |  31 ++-
+ doc/src/sgml/libpq.sgml        | 341 +++++++++++++++++++++++++--------
+ doc/src/sgml/runtime.sgml      | 124 +++++++++++-
+ src/backend/libpq/README.SSL   |  28 +++
+ 6 files changed, 494 insertions(+), 93 deletions(-)
+
+diff --git a/doc/src/sgml/acronyms.sgml b/doc/src/sgml/acronyms.sgml
+index 9ed148ab84..4da20cb4d3 100644
+--- a/doc/src/sgml/acronyms.sgml
++++ b/doc/src/sgml/acronyms.sgml
+@@ -452,6 +452,28 @@
+     </listitem>
+    </varlistentry>
+ 
++   <varlistentry>
++    <term><acronym>NSPR</acronym></term>
++    <listitem>
++     <para>
++      <ulink
++      url="https://developer.mozilla.org/en-US/docs/Mozilla/Projects/NSPR">
++      Netscape Portable Runtime</ulink>
++     </para>
++    </listitem>
++   </varlistentry>
++
++   <varlistentry>
++    <term><acronym>NSS</acronym></term>
++    <listitem>
++     <para>
++      <ulink
++      url="https://developer.mozilla.org/en-US/docs/Mozilla/Projects/NSS">
++      Network Security Services</ulink>
++     </para>
++    </listitem>
++   </varlistentry>
++
+    <varlistentry>
+     <term><acronym>ODBC</acronym></term>
+     <listitem>
+@@ -550,6 +572,17 @@
+     </listitem>
+    </varlistentry>
+ 
++   <varlistentry>
++    <term><acronym>PKCS#12</acronym></term>
++    <listitem>
++     <para>
++      <ulink
++      url="https://en.wikipedia.org/wiki/PKCS_12">
++      Public-Key Cryptography Standards #12</ulink>
++     </para>
++    </listitem>
++   </varlistentry>
++
+    <varlistentry>
+     <term><acronym>PL</acronym></term>
+     <listitem>
+diff --git a/doc/src/sgml/config.sgml b/doc/src/sgml/config.sgml
+index 2c31c35a6b..72cc95e05d 100644
+--- a/doc/src/sgml/config.sgml
++++ b/doc/src/sgml/config.sgml
+@@ -1310,6 +1310,24 @@ include_dir 'conf.d'
+       </listitem>
+      </varlistentry>
+ 
++     <varlistentry id="guc-ssl-database" xreflabel="ssl_database">
++      <term><varname>ssl_database</varname> (<type>string</type>)
++      <indexterm>
++       <primary><varname>ssl_database</varname> configuration parameter</primary>
++      </indexterm>
++      </term>
++      <listitem>
++       <para>
++        Specifies the name of the file containing the server certificates and
++        keys when using <productname>NSS</productname> for
++        <acronym>SSL</acronym>/<acronym>TLS</acronym>
++        connections. This parameter can only be set in the
++        <filename>postgresql.conf</filename> file or on the server command
++        line.
++       </para>
++      </listitem>
++     </varlistentry>
++
+      <varlistentry id="guc-ssl-ciphers" xreflabel="ssl_ciphers">
+       <term><varname>ssl_ciphers</varname> (<type>string</type>)
+       <indexterm>
+@@ -1326,7 +1344,9 @@ include_dir 'conf.d'
+         connections using TLS version 1.2 and lower are affected.  There is
+         currently no setting that controls the cipher choices used by TLS
+         version 1.3 connections.  The default value is
+-        <literal>HIGH:MEDIUM:+3DES:!aNULL</literal>.  The default is usually a
++        <literal>HIGH:MEDIUM:+3DES:!aNULL</literal> for servers which have
++        been built with <productname>OpenSSL</productname> as the
++        <acronym>SSL</acronym> library.  The default is usually a
+         reasonable choice unless you have specific security requirements.
+        </para>
+ 
+@@ -1538,8 +1558,12 @@ include_dir 'conf.d'
+        <para>
+         Sets an external command to be invoked when a passphrase for
+         decrypting an SSL file such as a private key needs to be obtained.  By
+-        default, this parameter is empty, which means the built-in prompting
+-        mechanism is used.
++        default, this parameter is empty. When the server is using
++        <productname>OpenSSL</productname>, this means the built-in prompting
++        mechanism is used. When using <productname>NSS</productname>, there is
++        no default prompting so a blank callback will be used returning an
++        empty password. This requires that the certificate database hasn't
++        been created with a password.
+        </para>
+        <para>
+         The command must print the passphrase to the standard output and exit
+diff --git a/doc/src/sgml/installation.sgml b/doc/src/sgml/installation.sgml
+index 1ebe8482bf..6dab945e07 100644
+--- a/doc/src/sgml/installation.sgml
++++ b/doc/src/sgml/installation.sgml
+@@ -999,14 +999,31 @@ build-postgresql:
+        <listitem>
+         <para>
+          Build with support for <acronym>SSL</acronym> (encrypted)
+-         connections. The only <replaceable>LIBRARY</replaceable>
+-         supported is <option>openssl</option>. This requires the
+-         <productname>OpenSSL</productname> package to be installed.
+-         <filename>configure</filename> will check for the required
+-         header files and libraries to make sure that your
+-         <productname>OpenSSL</productname> installation is sufficient
+-         before proceeding.
++         connections. <replaceable>LIBRARY</replaceable> must be one of:
+         </para>
++        <itemizedlist>
++         <listitem>
++          <para>
++           <option>openssl</option> to build with <productname>OpenSSL</productname> support.
++            This requires the <productname>OpenSSL</productname>
++            package to be installed.  <filename>configure</filename> will check
++            for the required header files and libraries to make sure
++            your <productname>OpenSSL</productname> installation is sufficient
++            before proceeding.
++          </para>
++         </listitem>
++         <listitem>
++          <para>
++           <option>nss</option> to build with <productname>libnss</productname> support.
++            This requires the <productname>NSS</productname> package to be installed. Additionally,
++            <productname>NSS</productname> requires <productname>NSPR</productname>
++            to be installed. <filename>configure</filename> will check for the
++            required header files and libraries to make sure that your
++            <productname>NSS</productname> installation is sufficient before
++            proceeding.
++          </para>
++         </listitem>
++        </itemizedlist>
+        </listitem>
+       </varlistentry>
+ 
+diff --git a/doc/src/sgml/libpq.sgml b/doc/src/sgml/libpq.sgml
+index 56689ba873..9e4f678b0b 100644
+--- a/doc/src/sgml/libpq.sgml
++++ b/doc/src/sgml/libpq.sgml
+@@ -835,6 +835,12 @@ int callback_fn(char *buf, int size, PGconn *conn);
+        <function>longjmp(...)</function>, etc. It must return normally.
+       </para>
+ 
++      <para>
++        <function>PQsetSSLKeyPassHook_OpenSSL</function> has no effect unless
++        the server was compiled with <productname>OpenSSL</productname>
++        support.
++      </para>
++
+      </listitem>
+     </varlistentry>
+ 
+@@ -851,6 +857,70 @@ PQsslKeyPassHook_OpenSSL_type PQgetSSLKeyPassHook_OpenSSL(void);
+ </synopsis>
+       </para>
+ 
++      <para>
++        <function>PQgetSSLKeyPassHook_OpenSSL</function> has no effect unless
++        the server was compiled with <productname>OpenSSL</productname>
++        support.
++      </para>
++
++     </listitem>
++    </varlistentry>
++
++    <varlistentry id="libpq-pqsetsslkeypasshook-nss">
++     <term><function>PQsetSSLKeyPassHook_nss</function><indexterm><primary>PQsetSSLKeyPassHook_nss</primary></indexterm></term>
++     <listitem>
++      <para>
++       <function>PQsetSSLKeyPassHook_nss</function> lets an application override
++       <application>libpq</application>'s default handling of password protected
++       objects in the <application>NSS</application> database using
++       <xref linkend="libpq-connect-sslpassword"/> or interactive prompting.
++
++<synopsis>
++void PQsetSSLKeyPassHook_nss(PQsslKeyPassHook_nss_type hook);
++</synopsis>
++
++       The application passes a pointer to a callback function with signature:
++<programlisting>
++char *callback_fn(PK11SlotInfo *slot, PRBool retry, void *arg);
++</programlisting>
++       which <application>libpq</application> will call
++       <emphasis>instead of</emphasis> its default
++       <function>PQdefaultSSLKeyPassHook_nss</function> password handler. The
++       callback should determine the password for the token and return a
++       pointer to it. The returned pointer should be allocated with the NSS
++       <function>PORT_Strdup</function> function. The token for which the
++       password is requested is recorded in the slot anc can be identified by
++       calling <function>PK11_GetTokenName</function>. If no password is
++       known, the callback should return <literal>NULL</literal>. The memory
++       will be owned by <productname>NSS</productname> and should not be
++       freed.
++      </para>
++
++      <para>
++        <function>PQsetSSLKeyPassHook_nss</function> has no effect unless
++        the server was compiled with <productname>NSS</productname> support.
++      </para>
++     </listitem>
++    </varlistentry>
++
++    <varlistentry id="libpq-pqgetsslkeypasshook-nss">
++     <term><function>PQgetSSLKeyPassHook_nss</function><indexterm><primary>PQgetSSLKeyPassHook_nss</primary></indexterm></term>
++     <listitem>
++      <para>
++       <function>PQgetSSLKeyPassHook_nss</function> returns the current
++       <productname>NSS</productname> password hook, or <literal>NULL</literal>
++       if none has been set.
++
++<synopsis>
++PQsslKeyPassHook_nss_type PQgetSSLKeyPassHook_nss(void);
++</synopsis>
++      </para>
++
++      <para>
++        <function>PQgetSSLKeyPassHook_nss</function> has no effect unless the
++        server was compiled with <productname>NSS</productname> support.
++      </para>
++
+      </listitem>
+     </varlistentry>
+ 
+@@ -1643,23 +1713,25 @@ postgresql://%2Fvar%2Flib%2Fpostgresql/dbname
+         If set to 1, data sent over SSL connections will be compressed.  If
+         set to 0, compression will be disabled.  The default is 0.  This
+         parameter is ignored if a connection without SSL is made.
+-       </para>
+-
+-       <para>
+         SSL compression is nowadays considered insecure and its use is no
+-        longer recommended.  <productname>OpenSSL</productname> 1.1.0 disables
+-        compression by default, and many operating system distributions
+-        disable it in prior versions as well, so setting this parameter to on
+-        will not have any effect if the server does not accept compression.
+-        <productname>PostgreSQL</productname> 14 disables compression
+-        completely in the backend.
+-       </para>
++        longer recommended.
++        <itemizedlist>
++         <listitem>
++          <para>
++           <productname>OpenSSL</productname>: 1.1.0 disables compression by
++           default, and many operating system distributions disable it in prior
++           versions as well, so setting this parameter to on will not have any
++           effect if the server does not accept compression.
++          </para>
++         </listitem>
+ 
+-       <para>
+-        If security is not a primary concern, compression can improve
+-        throughput if the network is the bottleneck.  Disabling compression
+-        can improve response time and throughput if CPU performance is the
+-        limiting factor.
++         <listitem>
++          <para>
++           <productname>NSS</productname>: SSL compression is not supported in
++           <productname>NSS</productname>, this parameter has no effect.
++          </para>
++         </listitem>
++        </itemizedlist>
+        </para>
+       </listitem>
+      </varlistentry>
+@@ -1668,10 +1740,24 @@ postgresql://%2Fvar%2Flib%2Fpostgresql/dbname
+       <term><literal>sslcert</literal></term>
+       <listitem>
+        <para>
+-        This parameter specifies the file name of the client SSL
+-        certificate, replacing the default
+-        <filename>~/.postgresql/postgresql.crt</filename>.
+-        This parameter is ignored if an SSL connection is not made.
++        This parameter specifies the name or location of the client SSL
++        certificate.  This parameter is ignored if an SSL connection is not
++        made.
++        <itemizedlist>
++         <listitem>
++          <para>
++           <productname>OpenSSL</productname>: can replace the default
++           <filename>~/.postgresql/postgresql.crt</filename>.
++          </para>
++         </listitem>
++
++         <listitem>
++          <para>
++           <productname>NSS</productname>: the nickname of the client SSL
++           certificate.
++          </para>
++         </listitem>
++        </itemizedlist>
+        </para>
+       </listitem>
+      </varlistentry>
+@@ -1680,15 +1766,30 @@ postgresql://%2Fvar%2Flib%2Fpostgresql/dbname
+       <term><literal>sslkey</literal></term>
+       <listitem>
+        <para>
+-        This parameter specifies the location for the secret key used for
+-        the client certificate. It can either specify a file name that will
+-        be used instead of the default
+-        <filename>~/.postgresql/postgresql.key</filename>, or it can specify a key
+-        obtained from an external <quote>engine</quote> (engines are
+-        <productname>OpenSSL</productname> loadable modules).  An external engine
+-        specification should consist of a colon-separated engine name and
+-        an engine-specific key identifier.  This parameter is ignored if an
+-        SSL connection is not made.
++        This parameter specifies the name or location for the secret key used
++        for the client certificate. This parameter is ignored if an SSL
++        connection is not made.
++        <itemizedlist>
++         <listitem>
++          <para>
++           <productname>OpenSSL</productname>: can either specify a file name
++           that will be used instead of the default
++           <filename>~/.postgresql/postgresql.key</filename>, or it can specify
++           a key obtained from an external <quote>engine</quote> (engines are
++           <productname>OpenSSL</productname> loadable modules).  An external
++           engine specification should consist of a colon-separated engine name
++           and an engine-specific key identifier.
++          </para>
++         </listitem>
++
++         <listitem>
++          <para>
++           <productname>NSS</productname>: this parameter has no effect.  Keys
++           should be loaded into the <productname>NSS</productname>
++           database.
++          </para>
++         </listitem>
++        </itemizedlist>
+        </para>
+       </listitem>
+      </varlistentry>
+@@ -1699,28 +1800,44 @@ postgresql://%2Fvar%2Flib%2Fpostgresql/dbname
+        <para>
+         This parameter specifies the password for the secret key specified in
+         <literal>sslkey</literal>, allowing client certificate private keys
+-        to be stored in encrypted form on disk even when interactive passphrase
++        to be stored in encrypted form even when interactive passphrase
+         input is not practical.
+-       </para>
+-       <para>
+-        Specifying this parameter with any non-empty value suppresses the
+-        <literal>Enter PEM pass phrase:</literal>
+-        prompt that <productname>OpenSSL</productname> will emit by default
+-        when an encrypted client certificate key is provided to
+-        <literal>libpq</literal>.
+-       </para>
+-       <para>
+-        If the key is not encrypted this parameter is ignored. The parameter
+-        has no effect on keys specified by <productname>OpenSSL</productname>
+-        engines unless the engine uses the <productname>OpenSSL</productname>
+-        password callback mechanism for prompts.
+-       </para>
+-       <para>
+-        There is no environment variable equivalent to this option, and no
+-        facility for looking it up in <filename>.pgpass</filename>. It can be
+-        used in a service file connection definition. Users with
+-        more sophisticated uses should consider using <productname>OpenSSL</productname> engines and
+-        tools like PKCS#11 or USB crypto offload devices.
++        <itemizedlist>
++         <listitem>
++          <para>
++           <productname>OpenSSL</productname>: specifying this parameter with
++           any non-empty value suppresses the
++           <literal>Enter PEM pass phrase:</literal> prompt that
++           <productname>OpenSSL</productname> will emit by default when an
++           encrypted client certificate key is provided to
++           <literal>libpq</literal>.
++          </para>
++          <para>
++           If the key is not encrypted this parameter is ignored. The parameter
++           has no effect on keys specified by <productname>OpenSSL</productname>
++           engines unless the engine uses the <productname>OpenSSL</productname>
++           password callback mechanism for prompts.
++          </para>
++          <para>
++           There is no environment variable equivalent to this option, and no
++           facility for looking it up in <filename>.pgpass</filename>. It can be
++           used in a service file connection definition. Users with
++           more sophisticated uses should consider using
++           <productname>OpenSSL</productname> engines and tools like PKCS#11 or
++           USB crypto offload devices.
++          </para>
++         </listitem>
++
++         <listitem>
++          <para>
++           <productname>NSS</productname>: specifying the parameter is required
++           in case any password protected items are referenced in the
++           <productname>NSS</productname> database, or if the database itself
++           is password protected. All attempts to decrypt objects which are
++           password protected in the database will use this password.
++          </para>
++         </listitem>
++        </itemizedlist>
+        </para>
+       </listitem>
+      </varlistentry>
+@@ -1729,11 +1846,27 @@ postgresql://%2Fvar%2Flib%2Fpostgresql/dbname
+       <term><literal>sslrootcert</literal></term>
+       <listitem>
+        <para>
+-        This parameter specifies the name of a file containing SSL
+-        certificate authority (<acronym>CA</acronym>) certificate(s).
+-        If the file exists, the server's certificate will be verified
+-        to be signed by one of these authorities.  The default is
+-        <filename>~/.postgresql/root.crt</filename>.
++        This parameter specifies the name of SSL certificate authority
++        (<acronym>CA</acronym>) certificate(s).
++        <itemizedlist>
++         <listitem>
++          <para>
++           <productname>OpenSSL</productname>: specifies the name of a file
++           containing SSL certificate authority (<acronym>CA</acronym>)
++           certificate(s).  If the file exists, the server's certificate will
++           be verified to be signed by one of these authorities.  The default is
++           <filename>~/.postgresql/root.crt</filename>.
++          </para>
++         </listitem>
++
++         <listitem>
++          <para>
++           <productname>NSS</productname>: this parameter has no effect.  CA
++           certificates should be loaded into the <productname>NSS</productname>
++           database using the <application>certutil</application> tool.
++          </para>
++         </listitem>
++        </itemizedlist>
+        </para>
+       </listitem>
+      </varlistentry>
+@@ -1743,13 +1876,29 @@ postgresql://%2Fvar%2Flib%2Fpostgresql/dbname
+       <listitem>
+        <para>
+         This parameter specifies the file name of the SSL certificate
+-        revocation list (CRL).  Certificates listed in this file, if it
+-        exists, will be rejected while attempting to authenticate the
+-        server's certificate.  If neither
+-        <xref linkend='libpq-connect-sslcrl'/> nor
+-        <xref linkend='libpq-connect-sslcrldir'/> is set, this setting is
+-        taken as
+-        <filename>~/.postgresql/root.crl</filename>.
++        revocation list (CRL).  
++
++        <itemizedlist>
++         <listitem>
++          <para>
++           <productname>OpenSSL</productname>: Certificates listed in this file,
++           if it exists, will be rejected while attempting to authenticate the
++           server's certificate.  If neither
++           <xref linkend='libpq-connect-sslcrl'/> nor
++           <xref linkend='libpq-connect-sslcrldir'/> is set, this setting is
++           taken as <filename>~/.postgresql/root.crl</filename>. 
++          </para>
++         </listitem>
++
++         <listitem>
++          <para>
++           <productname>NSS</productname>: This parameter has no effect.  CRL
++           files should be loaded into the <productname>NSS</productname>
++           database using the <application>crlutil</application> tool.
++          </para>
++         </listitem>
++        </itemizedlist>
++
+        </para>
+       </listitem>
+      </varlistentry>
+@@ -1762,19 +1911,31 @@ postgresql://%2Fvar%2Flib%2Fpostgresql/dbname
+         revocation list (CRL).  Certificates listed in the files in this
+         directory, if it exists, will be rejected while attempting to
+         authenticate the server's certificate.
+-       </para>
+ 
+-       <para>
+-        The directory needs to be prepared with the
+-        <productname>OpenSSL</productname> command
+-        <literal>openssl rehash</literal> or <literal>c_rehash</literal>.  See
+-        its documentation for details.
+-       </para>
++        <itemizedlist>
++         <listitem>
++          <para>
++           <productname>OpenSSL</productname>: the directory needs to be
++           prepared with the <productname>OpenSSL</productname> command
++           <literal>openssl rehash</literal> or <literal>c_rehash</literal>.
++           See its documentation for details.
++          </para>
++          <para>
++           Both <literal>sslcrl</literal> and <literal>sslcrldir</literal> can
++           be specified together.
++          </para>
++         </listitem>
+ 
+-       <para>
+-        Both <literal>sslcrl</literal> and <literal>sslcrldir</literal> can be
+-        specified together.
++         <listitem>
++          <para>
++           <productname>NSS</productname>: This parameter has no effect.  CRL
++           files should be loaded into the <productname>NSS</productname>
++           database using the <application>crlutil</application> tool.
++          </para>
++         </listitem>
++        </itemizedlist>
+        </para>
++
+       </listitem>
+      </varlistentry>
+ 
+@@ -1829,8 +1990,8 @@ postgresql://%2Fvar%2Flib%2Fpostgresql/dbname
+         for the connection. Valid values are <literal>TLSv1</literal>,
+         <literal>TLSv1.1</literal>, <literal>TLSv1.2</literal> and
+         <literal>TLSv1.3</literal>. The supported protocols depend on the
+-        version of <productname>OpenSSL</productname> used, older versions
+-        not supporting the most modern protocol versions. If not specified,
++        version of the SSL library used, older versions may 
++        not support the most modern protocol versions. If not specified,
+         the default is <literal>TLSv1.2</literal>, which satisfies industry
+         best practices as of this writing.
+        </para>
+@@ -1845,8 +2006,8 @@ postgresql://%2Fvar%2Flib%2Fpostgresql/dbname
+         for the connection. Valid values are <literal>TLSv1</literal>,
+         <literal>TLSv1.1</literal>, <literal>TLSv1.2</literal> and
+         <literal>TLSv1.3</literal>. The supported protocols depend on the
+-        version of <productname>OpenSSL</productname> used, older versions
+-        not supporting the most modern protocol versions. If not set, this
++        version of the SSL library used, older versions
++        may not support the most modern protocol versions. If not set, this
+         parameter is ignored and the connection will use the maximum bound
+         defined by the backend, if set. Setting the maximum protocol version
+         is mainly useful for testing or if some component has issues working
+@@ -2608,6 +2769,8 @@ void *PQsslStruct(const PGconn *conn, const char *struct_name);
+       </para>
+       <para>
+        The struct(s) available depend on the SSL implementation in use.
++      </para>
++      <para>
+        For <productname>OpenSSL</productname>, there is one struct,
+        available under the name "OpenSSL", and it returns a pointer to the
+        <productname>OpenSSL</productname> <literal>SSL</literal> struct.
+@@ -2631,9 +2794,15 @@ void *PQsslStruct(const PGconn *conn, const char *struct_name);
+ ]]></programlisting>
+       </para>
+       <para>
+-       This structure can be used to verify encryption levels, check server
+-       certificates, and more. Refer to the <productname>OpenSSL</productname>
+-       documentation for information about this structure.
++       For <productname>NSS</productname>, there is one struct available under
++       the name "NSS", and it returns a pointer to the
++       <productname>NSS</productname> <acronym>SSL</acronym>
++       <literal>PRFileDesc</literal> associated with the connection.
++      </para>
++      <para>
++       These structures can be used to verify encryption levels, check server
++       certificates, and more. Refer to the <acronym>SSL</acronym> library
++       documentation for information about these structures.
+       </para>
+      </listitem>
+     </varlistentry>
+@@ -2660,6 +2829,10 @@ void *PQgetssl(const PGconn *conn);
+        <xref linkend="libpq-PQsslInUse"/> instead, and for more details about the
+        connection, use <xref linkend="libpq-PQsslAttribute"/>.
+       </para>
++      <para>
++       This function returns <literal>NULL</literal> when <acronym>SSL</acronym>
++       librariaes other than <productname>OpenSSL</productname> are used.
++      </para>
+      </listitem>
+     </varlistentry>
+ 
+@@ -8708,6 +8881,12 @@ void PQinitOpenSSL(int do_ssl, int do_crypto);
+        before first opening a database connection.  Also be sure that you
+        have done that initialization before opening a database connection.
+       </para>
++
++      <para>
++       This function does nothing when using <productname>NSS</productname> as
++       the <acronym>SSL</acronym> library, no special initialization is
++       required for <productname>NSS</productname>.
++      </para>
+      </listitem>
+     </varlistentry>
+ 
+@@ -8734,6 +8913,12 @@ void PQinitSSL(int do_ssl);
+        might be preferable for applications that need to work with older
+        versions of <application>libpq</application>.
+       </para>
++
++      <para>
++       This function does nothing when using <productname>NSS</productname> as
++       the <acronym>SSL</acronym> library, no special initialization is
++       required for <productname>NSS</productname>.
++      </para>
+      </listitem>
+     </varlistentry>
+    </variablelist>
+diff --git a/doc/src/sgml/runtime.sgml b/doc/src/sgml/runtime.sgml
+index f1cbc1d9e9..04f73532f2 100644
+--- a/doc/src/sgml/runtime.sgml
++++ b/doc/src/sgml/runtime.sgml
+@@ -2185,15 +2185,21 @@ pg_dumpall -p 5432 | psql -d postgres -p 5433
+ 
+   <indexterm zone="ssl-tcp">
+    <primary>SSL</primary>
++   <secondary>TLS</secondary>
+   </indexterm>
+ 
+   <para>
+    <productname>PostgreSQL</productname> has native support for using
+    <acronym>SSL</acronym> connections to encrypt client/server communications
+    for increased security. This requires that
+-   <productname>OpenSSL</productname> is installed on both client and
++   a supported TLS library is installed on both client and
+    server systems and that support in <productname>PostgreSQL</productname> is
+    enabled at build time (see <xref linkend="installation"/>).
++   Supported libraries are <productname>OpenSSL</productname> and
++   <productname>NSS</productname>. The terms <acronym>SSL</acronym> and
++   <acronym>TLS</acronym> are often used interchangeably to mean a secure
++   connection using a <acronym>TLS</acronym> protocol, even though
++   <acronym>SSL</acronym> protocols are no longer supported.
+   </para>
+ 
+   <sect2 id="ssl-setup">
+@@ -2213,8 +2219,13 @@ pg_dumpall -p 5432 | psql -d postgres -p 5433
+   </para>
+ 
+   <para>
+-   To start in <acronym>SSL</acronym> mode, files containing the server certificate
+-   and private key must exist.  By default, these files are expected to be
++   To start in <acronym>SSL</acronym> mode, a server certificate
++   and private key must exist. The below sections on the different libraries
++   will discuss how to configure these.
++  </para>
++   
++  <para>
++   By default, these files are expected to be
+    named <filename>server.crt</filename> and <filename>server.key</filename>, respectively, in
+    the server's data directory, but other names and locations can be specified
+    using the configuration parameters <xref linkend="guc-ssl-cert-file"/>
+@@ -2304,6 +2315,18 @@ pg_dumpall -p 5432 | psql -d postgres -p 5433
+   </note>
+   </sect2>
+ 
++  <sect2 id="ssl-nss-config">
++   <title>NSS Configuration</title>
++
++  <para>
++   <productname>PostgreSQL</productname> will look for certificates and keys
++   in the <productname>NSS</productname> database specified by the parameter
++   <xref linkend="guc-ssl-database"/> in <filename>postgresql.conf</filename>.
++   The parameters for certificate and key filenames are used to identify the
++   nicknames in the database.
++  </para>
++  </sect2>
++
+   <sect2 id="ssl-client-certificates">
+    <title>Using Client Certificates</title>
+ 
+@@ -2378,7 +2401,7 @@ pg_dumpall -p 5432 | psql -d postgres -p 5433
+   </sect2>
+ 
+   <sect2 id="ssl-server-files">
+-   <title>SSL Server File Usage</title>
++   <title>SSL Server File Parameter Usage</title>
+ 
+    <para>
+     <xref linkend="ssl-file-usage"/> summarizes the files that are
+@@ -2425,6 +2448,14 @@ pg_dumpall -p 5432 | psql -d postgres -p 5433
+       <entry>client certificate must not be on this list</entry>
+      </row>
+ 
++     <row>
++      <entry><xref linkend="guc-ssl-database"/></entry>
++      <entry>certificate database</entry>
++      <entry>contains server certificates, keys and revocation lists; only
++      used when <productname>PostgreSQL</productname> is built with support
++      for <productname>NSS</productname>.</entry>
++     </row>
++
+     </tbody>
+    </tgroup>
+   </table>
+@@ -2448,7 +2479,7 @@ pg_dumpall -p 5432 | psql -d postgres -p 5433
+   </sect2>
+ 
+   <sect2 id="ssl-certificate-creation">
+-   <title>Creating Certificates</title>
++   <title>Creating Certificates with OpenSSL</title>
+ 
+    <para>
+      To create a simple self-signed certificate for the server, valid for 365
+@@ -2552,6 +2583,89 @@ openssl x509 -req -in server.csr -text -days 365 \
+    </para>
+   </sect2>
+ 
++  <sect2 id="nss-certificate-database">
++   <title>NSS Certificate Databases</title>
++
++   <para>
++    When using <productname>NSS</productname>, all certificates and keys must
++    be loaded into an <productname>NSS</productname> certificate database.
++   </para>
++
++   <para>
++    To create a new <productname>NSS</productname> certificate database and
++    load the certificates created in <xref linkend="ssl-certificate-creation" />,
++    use the following <productname>NSS</productname> commands:
++<programlisting>
++certutil -d "sql:server.db" -N --empty-password
++certutil -d "sql:server.db" -A -n server.crt -i server.crt -t "CT,C,C"
++certutil -d "sql:server.db" -A -n root.crt -i root.crt -t "CT,C,C"
++</programlisting>
++    This will give the certificate the filename as the nickname identifier in
++    the database which is created as <filename>server.db</filename>.
++   </para>
++   <para>
++    Then load the server key, which requires converting it to
++    <acronym>PKCS#12</acronym> format using the
++    <productname>OpenSSL</productname> tools:
++<programlisting>
++openssl pkcs12 -export -out server.pfx -inkey server.key -in server.crt \
++  -certfile root.crt -passout pass:
++pk12util -i server.pfx -d server.db -W ''
++</programlisting>
++   </para>
++   <para>
++    Finally a certificate revocation list can be loaded with the following
++    commands:
++<programlisting>
++crlutil -I -i server.crl -d server.db -B
++</programlisting>
++   </para>
++  </sect2>
++
++  <sect2 id="nss-ssl-certificate-creation">
++   <title>Creating Certificates with NSS</title>
++
++   <para>
++    To create a simple self-signed CA and certificate for the server, use the
++    following NSS commands. Replace
++    <replaceable>*.yourdomain.com</replaceable> with the server's host
++    name. Remove <replaceable>--empty-password</replaceable> in order to set
++    a password protecting the databases. The password can be passed to
++    <application>certutil</application> with the <literal>-f</literal> parameter.
++    First create a self-signed CA. To use a different certificate validity
++    time than the default, use <replaceable>-v</replaceable> to specify the
++    number of months of validity.
++<programlisting>
++mkdir root_ca.db
++certutil -N -d "sql:root_ca.db/" --empty-password
++certutil -S -d "sql:root_ca.db/" -n root_ca -s "CN=<replaceable>ca.yourdomain.com</replaceable>" \
++  -x -k rsa -g 2048 -m <replaceable>5432</replaceable> -t CTu,CTu,CTu \
++  --keyUsage certSigning -2 --nsCertType sslCA,smimeCA,objectSigningCA \
++  -Z SHA256
++certutil -L -d "sql:root_ca.db/" -n root_ca -a > root_ca.pem
++</programlisting>
++    Now create a server certificate database, and create a certificate signing
++    request for the CA. Then sign the request with the already created CA and
++    insert the certificate chain into the certificate database.
++<programlisting>
++mkdir server_cert.db
++certutil -N -d "sql:server_cert.db/" --empty-password
++certutil -R -d "sql:server_cert.db/" -s "CN=dbhost.yourdomain.com" \
++  -o server_cert.csr -g 2048 -Z SHA256
++
++certutil -C -d "sql:root_ca.db/" -c root_ca -i server_cert.csr \
++  -o server_cert.der -m <replaceable>5433</replaceable> \
++  --keyUsage keyEncipherment,dataEncipherment,digitalSignature \
++  --nsCertType sslServer -Z SHA256
++
++certutil -A -d "sql:server_cert.db/" -n root_ca -t CTu,CTu,CTu -a -i root_ca.pem
++certutil -A -d "sql:server_cert.db/" -n server_cert -t CTu,CTu,CTu -i server_cert.der
++</programlisting>
++    The server certificate is loaded into the certificate database as well as
++    the CA certificate in order to provide the chain of certificates.
++   </para>
++  </sect2>
++
+  </sect1>
+ 
+  <sect1 id="gssapi-enc">
+diff --git a/src/backend/libpq/README.SSL b/src/backend/libpq/README.SSL
+index d84a434a6e..c0722b558d 100644
+--- a/src/backend/libpq/README.SSL
++++ b/src/backend/libpq/README.SSL
+@@ -80,3 +80,31 @@ are unacceptable.
+ The downside to EDH is that it makes it impossible to use ssldump(1)
+ if there's a problem establishing an SSL session.  In this case you'll
+ need to temporarily disable EDH (see initialize_dh()).
++
++
++Supporting a new TLS backend
++============================
++
++TLS support in PostgreSQL is implemented with an API which abstracts any
++knowledge about the library used from core server backend and frontend code.
++Adding support for a new TLS library can be done almost without changing any
++core PostgreSQL code. The modules which needs to be implemented are briefly
++described below.
++
++Each supported TLS library is implemented in its own file for the libpq
++frontend and backend. The API is defined in be-secure.c and fe-secure.c
++respectively. Each library can add relevant connection structures to the
++Port and PGConn objects.
++
++pg_cryptohash is an internal API for invoking cryptographic hash algorithms
++on data. Each supported TLS library implements the API defined in the header
++common/cryptohash.h, with the implementation used decided at build-time.
++
++pg_strong_random provide the backend with a source of cryptographically secure
++random numbers.
++
++contrib/sslinfo provide similar information to pg_stat_ssl, with a few library
++specific extensions.
++
++contrib/pgcrypto provide a larger selection of digest and hash algorithms
++when compiled against a TLS library.
+-- 
+2.30.1 (Apple Git-130)
+

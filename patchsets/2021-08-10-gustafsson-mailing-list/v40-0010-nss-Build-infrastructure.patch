@@ -1,0 +1,693 @@
+From 8c135f1df75fe86ea11987ed044c2595bd0f0c93 Mon Sep 17 00:00:00 2001
+From: Daniel Gustafsson <daniel@yesql.se>
+Date: Mon, 8 Feb 2021 23:52:55 +0100
+Subject: [PATCH v40 10/10] nss: Build infrastructure
+
+Finally this adds the infrastructure to build a postgres installation
+with libnss support.
+---
+ configure                     | 294 +++++++++++++++++++++++++++++++++-
+ configure.ac                  |  31 +++-
+ src/backend/libpq/Makefile    |   4 +
+ src/common/Makefile           |   8 +
+ src/include/pg_config.h.in    |  12 ++
+ src/interfaces/libpq/Makefile |   5 +
+ src/tools/msvc/Install.pm     |   3 +-
+ src/tools/msvc/Mkvcbuild.pm   |  40 ++++-
+ src/tools/msvc/Solution.pm    |  26 +++
+ 9 files changed, 411 insertions(+), 12 deletions(-)
+
+diff --git a/configure b/configure
+index 7542fe30a1..3c984b0927 100755
+--- a/configure
++++ b/configure
+@@ -654,6 +654,8 @@ UUID_LIBS
+ LDAP_LIBS_BE
+ LDAP_LIBS_FE
+ with_ssl
++NSPR_CONFIG
++NSS_CONFIG
+ PTHREAD_CFLAGS
+ PTHREAD_LIBS
+ PTHREAD_CC
+@@ -1577,7 +1579,7 @@ Optional Packages:
+   --without-zlib          do not use Zlib
+   --with-lz4              build with LZ4 support
+   --with-gnu-ld           assume the C compiler uses GNU ld [default=no]
+-  --with-ssl=LIB          use LIB for SSL/TLS support (openssl)
++  --with-ssl=LIB          use LIB for SSL/TLS support (openssl, nss)
+   --with-openssl          obsolete spelling of --with-ssl=openssl
+ 
+ Some influential environment variables:
+@@ -12709,8 +12711,274 @@ done
+ 
+ $as_echo "#define USE_OPENSSL 1" >>confdefs.h
+ 
++elif test "$with_ssl" = nss ; then
++  # TODO: fallback in case nss-config/nspr-config aren't found.
++  if test -z "$NSS_CONFIG"; then
++  for ac_prog in nss-config
++do
++  # Extract the first word of "$ac_prog", so it can be a program name with args.
++set dummy $ac_prog; ac_word=$2
++{ $as_echo "$as_me:${as_lineno-$LINENO}: checking for $ac_word" >&5
++$as_echo_n "checking for $ac_word... " >&6; }
++if ${ac_cv_path_NSS_CONFIG+:} false; then :
++  $as_echo_n "(cached) " >&6
++else
++  case $NSS_CONFIG in
++  [\\/]* | ?:[\\/]*)
++  ac_cv_path_NSS_CONFIG="$NSS_CONFIG" # Let the user override the test with a path.
++  ;;
++  *)
++  as_save_IFS=$IFS; IFS=$PATH_SEPARATOR
++for as_dir in $PATH
++do
++  IFS=$as_save_IFS
++  test -z "$as_dir" && as_dir=.
++    for ac_exec_ext in '' $ac_executable_extensions; do
++  if as_fn_executable_p "$as_dir/$ac_word$ac_exec_ext"; then
++    ac_cv_path_NSS_CONFIG="$as_dir/$ac_word$ac_exec_ext"
++    $as_echo "$as_me:${as_lineno-$LINENO}: found $as_dir/$ac_word$ac_exec_ext" >&5
++    break 2
++  fi
++done
++  done
++IFS=$as_save_IFS
++
++  ;;
++esac
++fi
++NSS_CONFIG=$ac_cv_path_NSS_CONFIG
++if test -n "$NSS_CONFIG"; then
++  { $as_echo "$as_me:${as_lineno-$LINENO}: result: $NSS_CONFIG" >&5
++$as_echo "$NSS_CONFIG" >&6; }
++else
++  { $as_echo "$as_me:${as_lineno-$LINENO}: result: no" >&5
++$as_echo "no" >&6; }
++fi
++
++
++  test -n "$NSS_CONFIG" && break
++done
++
++else
++  # Report the value of NSS_CONFIG in configure's output in all cases.
++  { $as_echo "$as_me:${as_lineno-$LINENO}: checking for NSS_CONFIG" >&5
++$as_echo_n "checking for NSS_CONFIG... " >&6; }
++  { $as_echo "$as_me:${as_lineno-$LINENO}: result: $NSS_CONFIG" >&5
++$as_echo "$NSS_CONFIG" >&6; }
++fi
++
++  if test -z "$NSPR_CONFIG"; then
++  for ac_prog in nspr-config
++do
++  # Extract the first word of "$ac_prog", so it can be a program name with args.
++set dummy $ac_prog; ac_word=$2
++{ $as_echo "$as_me:${as_lineno-$LINENO}: checking for $ac_word" >&5
++$as_echo_n "checking for $ac_word... " >&6; }
++if ${ac_cv_path_NSPR_CONFIG+:} false; then :
++  $as_echo_n "(cached) " >&6
++else
++  case $NSPR_CONFIG in
++  [\\/]* | ?:[\\/]*)
++  ac_cv_path_NSPR_CONFIG="$NSPR_CONFIG" # Let the user override the test with a path.
++  ;;
++  *)
++  as_save_IFS=$IFS; IFS=$PATH_SEPARATOR
++for as_dir in $PATH
++do
++  IFS=$as_save_IFS
++  test -z "$as_dir" && as_dir=.
++    for ac_exec_ext in '' $ac_executable_extensions; do
++  if as_fn_executable_p "$as_dir/$ac_word$ac_exec_ext"; then
++    ac_cv_path_NSPR_CONFIG="$as_dir/$ac_word$ac_exec_ext"
++    $as_echo "$as_me:${as_lineno-$LINENO}: found $as_dir/$ac_word$ac_exec_ext" >&5
++    break 2
++  fi
++done
++  done
++IFS=$as_save_IFS
++
++  ;;
++esac
++fi
++NSPR_CONFIG=$ac_cv_path_NSPR_CONFIG
++if test -n "$NSPR_CONFIG"; then
++  { $as_echo "$as_me:${as_lineno-$LINENO}: result: $NSPR_CONFIG" >&5
++$as_echo "$NSPR_CONFIG" >&6; }
++else
++  { $as_echo "$as_me:${as_lineno-$LINENO}: result: no" >&5
++$as_echo "no" >&6; }
++fi
++
++
++  test -n "$NSPR_CONFIG" && break
++done
++
++else
++  # Report the value of NSPR_CONFIG in configure's output in all cases.
++  { $as_echo "$as_me:${as_lineno-$LINENO}: checking for NSPR_CONFIG" >&5
++$as_echo_n "checking for NSPR_CONFIG... " >&6; }
++  { $as_echo "$as_me:${as_lineno-$LINENO}: result: $NSPR_CONFIG" >&5
++$as_echo "$NSPR_CONFIG" >&6; }
++fi
++
++  if test -n "$NSS_CONFIG"; then
++    NSS_LIBS=`$NSS_CONFIG --libs`
++	NSS_CFLAGS=`$NSS_CONFIG --cflags`
++  fi
++  if test -n "$NSPR_CONFIG"; then
++	NSPR_LIBS=`$NSPR_CONFIG --libs`
++	NSPR_CFLAGS=`$NSPR_CONFIG --cflags`
++  fi
++
++  LDFLAGS="$LDFLAGS $NSS_LIBS $NSPR_LIBS"
++  CFLAGS="$CFLAGS $NSS_CFLAGS $NSPR_CFLAGS"
++
++  { $as_echo "$as_me:${as_lineno-$LINENO}: checking for NSS_InitContext in -lnss3" >&5
++$as_echo_n "checking for NSS_InitContext in -lnss3... " >&6; }
++if ${ac_cv_lib_nss3_NSS_InitContext+:} false; then :
++  $as_echo_n "(cached) " >&6
++else
++  ac_check_lib_save_LIBS=$LIBS
++LIBS="-lnss3  $LIBS"
++cat confdefs.h - <<_ACEOF >conftest.$ac_ext
++/* end confdefs.h.  */
++
++/* Override any GCC internal prototype to avoid an error.
++   Use char because int might match the return type of a GCC
++   builtin and then its argument prototype would still apply.  */
++#ifdef __cplusplus
++extern "C"
++#endif
++char NSS_InitContext ();
++int
++main ()
++{
++return NSS_InitContext ();
++  ;
++  return 0;
++}
++_ACEOF
++if ac_fn_c_try_link "$LINENO"; then :
++  ac_cv_lib_nss3_NSS_InitContext=yes
++else
++  ac_cv_lib_nss3_NSS_InitContext=no
++fi
++rm -f core conftest.err conftest.$ac_objext \
++    conftest$ac_exeext conftest.$ac_ext
++LIBS=$ac_check_lib_save_LIBS
++fi
++{ $as_echo "$as_me:${as_lineno-$LINENO}: result: $ac_cv_lib_nss3_NSS_InitContext" >&5
++$as_echo "$ac_cv_lib_nss3_NSS_InitContext" >&6; }
++if test "x$ac_cv_lib_nss3_NSS_InitContext" = xyes; then :
++  cat >>confdefs.h <<_ACEOF
++#define HAVE_LIBNSS3 1
++_ACEOF
++
++  LIBS="-lnss3 $LIBS"
++
++else
++  as_fn_error $? "library 'nss3' is required for NSS" "$LINENO" 5
++fi
++
++  { $as_echo "$as_me:${as_lineno-$LINENO}: checking for PR_GetDefaultIOMethods in -lnspr4" >&5
++$as_echo_n "checking for PR_GetDefaultIOMethods in -lnspr4... " >&6; }
++if ${ac_cv_lib_nspr4_PR_GetDefaultIOMethods+:} false; then :
++  $as_echo_n "(cached) " >&6
++else
++  ac_check_lib_save_LIBS=$LIBS
++LIBS="-lnspr4  $LIBS"
++cat confdefs.h - <<_ACEOF >conftest.$ac_ext
++/* end confdefs.h.  */
++
++/* Override any GCC internal prototype to avoid an error.
++   Use char because int might match the return type of a GCC
++   builtin and then its argument prototype would still apply.  */
++#ifdef __cplusplus
++extern "C"
++#endif
++char PR_GetDefaultIOMethods ();
++int
++main ()
++{
++return PR_GetDefaultIOMethods ();
++  ;
++  return 0;
++}
++_ACEOF
++if ac_fn_c_try_link "$LINENO"; then :
++  ac_cv_lib_nspr4_PR_GetDefaultIOMethods=yes
++else
++  ac_cv_lib_nspr4_PR_GetDefaultIOMethods=no
++fi
++rm -f core conftest.err conftest.$ac_objext \
++    conftest$ac_exeext conftest.$ac_ext
++LIBS=$ac_check_lib_save_LIBS
++fi
++{ $as_echo "$as_me:${as_lineno-$LINENO}: result: $ac_cv_lib_nspr4_PR_GetDefaultIOMethods" >&5
++$as_echo "$ac_cv_lib_nspr4_PR_GetDefaultIOMethods" >&6; }
++if test "x$ac_cv_lib_nspr4_PR_GetDefaultIOMethods" = xyes; then :
++  cat >>confdefs.h <<_ACEOF
++#define HAVE_LIBNSPR4 1
++_ACEOF
++
++  LIBS="-lnspr4 $LIBS"
++
++else
++  as_fn_error $? "library 'nspr4' is required for NSS" "$LINENO" 5
++fi
++
++  { $as_echo "$as_me:${as_lineno-$LINENO}: checking for SSL_GetImplementedCiphers in -lssl3" >&5
++$as_echo_n "checking for SSL_GetImplementedCiphers in -lssl3... " >&6; }
++if ${ac_cv_lib_ssl3_SSL_GetImplementedCiphers+:} false; then :
++  $as_echo_n "(cached) " >&6
++else
++  ac_check_lib_save_LIBS=$LIBS
++LIBS="-lssl3  $LIBS"
++cat confdefs.h - <<_ACEOF >conftest.$ac_ext
++/* end confdefs.h.  */
++
++/* Override any GCC internal prototype to avoid an error.
++   Use char because int might match the return type of a GCC
++   builtin and then its argument prototype would still apply.  */
++#ifdef __cplusplus
++extern "C"
++#endif
++char SSL_GetImplementedCiphers ();
++int
++main ()
++{
++return SSL_GetImplementedCiphers ();
++  ;
++  return 0;
++}
++_ACEOF
++if ac_fn_c_try_link "$LINENO"; then :
++  ac_cv_lib_ssl3_SSL_GetImplementedCiphers=yes
++else
++  ac_cv_lib_ssl3_SSL_GetImplementedCiphers=no
++fi
++rm -f core conftest.err conftest.$ac_objext \
++    conftest$ac_exeext conftest.$ac_ext
++LIBS=$ac_check_lib_save_LIBS
++fi
++{ $as_echo "$as_me:${as_lineno-$LINENO}: result: $ac_cv_lib_ssl3_SSL_GetImplementedCiphers" >&5
++$as_echo "$ac_cv_lib_ssl3_SSL_GetImplementedCiphers" >&6; }
++if test "x$ac_cv_lib_ssl3_SSL_GetImplementedCiphers" = xyes; then :
++  cat >>confdefs.h <<_ACEOF
++#define HAVE_LIBSSL3 1
++_ACEOF
++
++  LIBS="-lssl3 $LIBS"
++
++else
++  as_fn_error $? "library 'ssl3' is required for NSS" "$LINENO" 5
++fi
++
++
++$as_echo "#define USE_NSS 1" >>confdefs.h
++
+ elif test "$with_ssl" != no ; then
+-  as_fn_error $? "--with-ssl must specify openssl" "$LINENO" 5
++  as_fn_error $? "--with-ssl must specify one of openssl or nss" "$LINENO" 5
+ fi
+ 
+ 
+@@ -13681,6 +13949,23 @@ else
+ fi
+ 
+ 
++elif test "$with_ssl" = nss ; then
++  ac_fn_c_check_header_mongrel "$LINENO" "nss/ssl.h" "ac_cv_header_nss_ssl_h" "$ac_includes_default"
++if test "x$ac_cv_header_nss_ssl_h" = xyes; then :
++
++else
++  as_fn_error $? "header file <nss/ssl.h> is required for NSS" "$LINENO" 5
++fi
++
++
++  ac_fn_c_check_header_mongrel "$LINENO" "nss/nss.h" "ac_cv_header_nss_nss_h" "$ac_includes_default"
++if test "x$ac_cv_header_nss_nss_h" = xyes; then :
++
++else
++  as_fn_error $? "header file <nss/nss.h> is required for NSS" "$LINENO" 5
++fi
++
++
+ fi
+ 
+ if test "$with_pam" = yes ; then
+@@ -18540,6 +18825,9 @@ $as_echo_n "checking which random number source to use... " >&6; }
+ if test x"$with_ssl" = x"openssl" ; then
+   { $as_echo "$as_me:${as_lineno-$LINENO}: result: OpenSSL" >&5
+ $as_echo "OpenSSL" >&6; }
++elif test x"$with_ssl" = x"nss" ; then
++  { $as_echo "$as_me:${as_lineno-$LINENO}: result: NSS" >&5
++$as_echo "NSS" >&6; }
+ elif test x"$PORTNAME" = x"win32" ; then
+   { $as_echo "$as_me:${as_lineno-$LINENO}: result: Windows native" >&5
+ $as_echo "Windows native" >&6; }
+@@ -18569,7 +18857,7 @@ fi
+   if test x"$ac_cv_file__dev_urandom" = x"no" ; then
+     as_fn_error $? "
+ no source of strong random numbers was found
+-PostgreSQL can use OpenSSL, native Windows API or /dev/urandom as a source of random numbers." "$LINENO" 5
++PostgreSQL can use OpenSSL, NSS, native Windows API or /dev/urandom as a source of random numbers." "$LINENO" 5
+   fi
+ fi
+ 
+diff --git a/configure.ac b/configure.ac
+index ed3cdb9a8e..68fcc8d4e5 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -1234,7 +1234,7 @@ fi
+ #
+ # There is currently only one supported SSL/TLS library: OpenSSL.
+ #
+-PGAC_ARG_REQ(with, ssl, [LIB], [use LIB for SSL/TLS support (openssl)])
++PGAC_ARG_REQ(with, ssl, [LIB], [use LIB for SSL/TLS support (openssl, nss)])
+ if test x"$with_ssl" = x"" ; then
+   with_ssl=no
+ fi
+@@ -1268,8 +1268,28 @@ if test "$with_ssl" = openssl ; then
+   # function was removed.
+   AC_CHECK_FUNCS([CRYPTO_lock])
+   AC_DEFINE([USE_OPENSSL], 1, [Define to 1 to build with OpenSSL support. (--with-ssl=openssl)])
++elif test "$with_ssl" = nss ; then
++  # TODO: fallback in case nss-config/nspr-config aren't found.
++  PGAC_PATH_PROGS(NSS_CONFIG, nss-config)
++  PGAC_PATH_PROGS(NSPR_CONFIG, nspr-config)
++  if test -n "$NSS_CONFIG"; then
++    NSS_LIBS=`$NSS_CONFIG --libs`
++	NSS_CFLAGS=`$NSS_CONFIG --cflags`
++  fi
++  if test -n "$NSPR_CONFIG"; then
++	NSPR_LIBS=`$NSPR_CONFIG --libs`
++	NSPR_CFLAGS=`$NSPR_CONFIG --cflags`
++  fi
++
++  LDFLAGS="$LDFLAGS $NSS_LIBS $NSPR_LIBS"
++  CFLAGS="$CFLAGS $NSS_CFLAGS $NSPR_CFLAGS"
++
++  AC_CHECK_LIB(nss3, NSS_InitContext, [], [AC_MSG_ERROR([library 'nss3' is required for NSS])])
++  AC_CHECK_LIB(nspr4, PR_GetDefaultIOMethods, [], [AC_MSG_ERROR([library 'nspr4' is required for NSS])])
++  AC_CHECK_LIB(ssl3, SSL_GetImplementedCiphers, [], [AC_MSG_ERROR([library 'ssl3' is required for NSS])])
++  AC_DEFINE([USE_NSS], 1, [Define to 1 if you have NSS support,])
+ elif test "$with_ssl" != no ; then
+-  AC_MSG_ERROR([--with-ssl must specify openssl])
++  AC_MSG_ERROR([--with-ssl must specify one of openssl or nss])
+ fi
+ AC_SUBST(with_ssl)
+ 
+@@ -1459,6 +1479,9 @@ fi
+ if test "$with_ssl" = openssl ; then
+   AC_CHECK_HEADER(openssl/ssl.h, [], [AC_MSG_ERROR([header file <openssl/ssl.h> is required for OpenSSL])])
+   AC_CHECK_HEADER(openssl/err.h, [], [AC_MSG_ERROR([header file <openssl/err.h> is required for OpenSSL])])
++elif test "$with_ssl" = nss ; then
++  AC_CHECK_HEADER(nss/ssl.h, [], [AC_MSG_ERROR([header file <nss/ssl.h> is required for NSS])])
++  AC_CHECK_HEADER(nss/nss.h, [], [AC_MSG_ERROR([header file <nss/nss.h> is required for NSS])])
+ fi
+ 
+ if test "$with_pam" = yes ; then
+@@ -2251,6 +2274,8 @@ fi
+ AC_MSG_CHECKING([which random number source to use])
+ if test x"$with_ssl" = x"openssl" ; then
+   AC_MSG_RESULT([OpenSSL])
++elif test x"$with_ssl" = x"nss" ; then
++  AC_MSG_RESULT([NSS])
+ elif test x"$PORTNAME" = x"win32" ; then
+   AC_MSG_RESULT([Windows native])
+ else
+@@ -2260,7 +2285,7 @@ else
+   if test x"$ac_cv_file__dev_urandom" = x"no" ; then
+     AC_MSG_ERROR([
+ no source of strong random numbers was found
+-PostgreSQL can use OpenSSL, native Windows API or /dev/urandom as a source of random numbers.])
++PostgreSQL can use OpenSSL, NSS, native Windows API or /dev/urandom as a source of random numbers.])
+   fi
+ fi
+ 
+diff --git a/src/backend/libpq/Makefile b/src/backend/libpq/Makefile
+index 6d385fd6a4..344fdf2e58 100644
+--- a/src/backend/libpq/Makefile
++++ b/src/backend/libpq/Makefile
+@@ -31,6 +31,10 @@ OBJS = \
+ 
+ ifeq ($(with_ssl),openssl)
+ OBJS += be-secure-openssl.o
++else
++ifeq ($(with_ssl),nss)
++OBJS += be-secure-nss.o
++endif
+ endif
+ 
+ ifeq ($(with_gssapi),yes)
+diff --git a/src/common/Makefile b/src/common/Makefile
+index 38a8599337..3157d057bf 100644
+--- a/src/common/Makefile
++++ b/src/common/Makefile
+@@ -86,6 +86,13 @@ OBJS_COMMON += \
+ 	cryptohash_openssl.o \
+ 	hmac_openssl.o
+ else
++ifeq ($(with_ssl),nss)
++OBJS_COMMON += \
++	hmac.o \
++	cipher_nss.o \
++	protocol_nss.o \
++	cryptohash_nss.o
++else
+ OBJS_COMMON += \
+ 	cryptohash.o \
+ 	hmac.o \
+@@ -93,6 +100,7 @@ OBJS_COMMON += \
+ 	sha1.o \
+ 	sha2.o
+ endif
++endif
+ 
+ # A few files are currently only built for frontend, not server
+ # (Mkvcbuild.pm has a copy of this list, too).  logging.c is excluded
+diff --git a/src/include/pg_config.h.in b/src/include/pg_config.h.in
+index 15ffdd895a..273b7f63d4 100644
+--- a/src/include/pg_config.h.in
++++ b/src/include/pg_config.h.in
+@@ -340,6 +340,12 @@
+ /* Define to 1 if you have the `m' library (-lm). */
+ #undef HAVE_LIBM
+ 
++/* Define to 1 if you have the `nspr4' library (-lnspr4). */
++#undef HAVE_LIBNSPR4
++
++/* Define to 1 if you have the `nss3' library (-lnss3). */
++#undef HAVE_LIBNSS3
++
+ /* Define to 1 if you have the `pam' library (-lpam). */
+ #undef HAVE_LIBPAM
+ 
+@@ -352,6 +358,9 @@
+ /* Define to 1 if you have the `ssl' library (-lssl). */
+ #undef HAVE_LIBSSL
+ 
++/* Define to 1 if you have the `ssl3' library (-lssl3). */
++#undef HAVE_LIBSSL3
++
+ /* Define to 1 if you have the `wldap32' library (-lwldap32). */
+ #undef HAVE_LIBWLDAP32
+ 
+@@ -926,6 +935,9 @@
+ /* Define to select named POSIX semaphores. */
+ #undef USE_NAMED_POSIX_SEMAPHORES
+ 
++/* Define to 1 if you have NSS support, */
++#undef USE_NSS
++
+ /* Define to 1 to build with OpenSSL support. (--with-ssl=openssl) */
+ #undef USE_OPENSSL
+ 
+diff --git a/src/interfaces/libpq/Makefile b/src/interfaces/libpq/Makefile
+index 7cbdeb589b..1fe6155e07 100644
+--- a/src/interfaces/libpq/Makefile
++++ b/src/interfaces/libpq/Makefile
+@@ -56,6 +56,11 @@ OBJS += \
+ 	fe-secure-openssl.o
+ endif
+ 
++ifeq ($(with_ssl), nss)
++OBJS += \
++	fe-secure-nss.o
++endif
++
+ ifeq ($(with_gssapi),yes)
+ OBJS += \
+ 	fe-gssapi-common.o \
+diff --git a/src/tools/msvc/Install.pm b/src/tools/msvc/Install.pm
+index c932322e35..d55611b024 100644
+--- a/src/tools/msvc/Install.pm
++++ b/src/tools/msvc/Install.pm
+@@ -440,7 +440,8 @@ sub CopyContribFiles
+ 		{
+ 			# These configuration-based exclusions must match vcregress.pl
+ 			next if ($d eq "uuid-ossp"  && !defined($config->{uuid}));
+-			next if ($d eq "sslinfo"    && !defined($config->{openssl}));
++			next if ($d eq "sslinfo"    && !defined($config->{openssl})
++			  && !defined($config->{nss}));
+ 			next if ($d eq "xml2"       && !defined($config->{xml}));
+ 			next if ($d =~ /_plperl$/   && !defined($config->{perl}));
+ 			next if ($d =~ /_plpython$/ && !defined($config->{python}));
+diff --git a/src/tools/msvc/Mkvcbuild.pm b/src/tools/msvc/Mkvcbuild.pm
+index 3cb46832ab..ccc347db0e 100644
+--- a/src/tools/msvc/Mkvcbuild.pm
++++ b/src/tools/msvc/Mkvcbuild.pm
+@@ -137,6 +137,12 @@ sub mkvcbuild
+ 		push(@pgcommonallfiles, 'hmac_openssl.c');
+ 		push(@pgcommonallfiles, 'protocol_openssl.c');
+ 	}
++	elsif ($solution->{options}->{nss})
++	{
++		push(@pgcommonallfiles, 'cryptohash_nss.c');
++		push(@pgcommonallfiles, 'cipher_nss.c');
++		push(@pgcommonallfiles, 'protocol_nss.c');
++	}
+ 	else
+ 	{
+ 		push(@pgcommonallfiles, 'cryptohash.c');
+@@ -202,12 +208,19 @@ sub mkvcbuild
+ 	$postgres->FullExportDLL('postgres.lib');
+ 
+ 	# The OBJS scraper doesn't know about ifdefs, so remove appropriate files
+-	# if building without OpenSSL.
+-	if (!$solution->{options}->{openssl})
++	# if building without various options.
++	if (!$solution->{options}->{openssl} && !$solution->{options}->{nss})
+ 	{
+ 		$postgres->RemoveFile('src/backend/libpq/be-secure-common.c');
++	}
++	if (!$solution->{options}->{openssl})
++	{
+ 		$postgres->RemoveFile('src/backend/libpq/be-secure-openssl.c');
+ 	}
++	if (!$solution->{options}->{nss})
++	{
++		$postgres->RemoveFile('src/backend/libpq/be-secure-nss.c');
++	}
+ 	if (!$solution->{options}->{gss})
+ 	{
+ 		$postgres->RemoveFile('src/backend/libpq/be-gssapi-common.c');
+@@ -265,12 +278,19 @@ sub mkvcbuild
+ 	$libpq->AddReference($libpgcommon, $libpgport);
+ 
+ 	# The OBJS scraper doesn't know about ifdefs, so remove appropriate files
+-	# if building without OpenSSL.
+-	if (!$solution->{options}->{openssl})
++	# if building without various options
++	if (!$solution->{options}->{openssl} && !$solution->{options}->{nss})
+ 	{
+ 		$libpq->RemoveFile('src/interfaces/libpq/fe-secure-common.c');
++	}
++	if (!$solution->{options}->{openssl})
++	{
+ 		$libpq->RemoveFile('src/interfaces/libpq/fe-secure-openssl.c');
+ 	}
++	if (!$solution->{options}->{nss})
++	{
++		$libpq->RemoveFile('src/interfaces/libpq/fe-secure-nss.c');
++	}
+ 	if (!$solution->{options}->{gss})
+ 	{
+ 		$libpq->RemoveFile('src/interfaces/libpq/fe-gssapi-common.c');
+@@ -438,9 +458,14 @@ sub mkvcbuild
+ 		push @contrib_excludes, 'xml2';
+ 	}
+ 
++	if (!$solution->{options}->{openssl} && !$solution->{options}->{nss})
++	{
++		push @contrib_excludes, 'sslinfo';
++	}
++
+ 	if (!$solution->{options}->{openssl})
+ 	{
+-		push @contrib_excludes, 'sslinfo', 'ssl_passphrase_callback';
++		push @contrib_excludes, 'ssl_passphrase_callback';
+ 	}
+ 
+ 	if (!$solution->{options}->{uuid})
+@@ -470,6 +495,11 @@ sub mkvcbuild
+ 		$pgcrypto->AddFiles('contrib/pgcrypto', 'openssl.c',
+ 			'pgp-mpi-openssl.c');
+ 	}
++	elsif ($solution->{options}->{nss})
++	{
++		$pgcrypto->AddFiles('contrib/pgcrypto', 'nss.c',
++			'pgp-mpi-internal.c', 'imath.c', 'blf.c');
++	}
+ 	else
+ 	{
+ 		$pgcrypto->AddFiles(
+diff --git a/src/tools/msvc/Solution.pm b/src/tools/msvc/Solution.pm
+index 165a93987a..e2d0cfb1da 100644
+--- a/src/tools/msvc/Solution.pm
++++ b/src/tools/msvc/Solution.pm
+@@ -307,10 +307,13 @@ sub GenerateFiles
+ 		HAVE_LIBLDAP                                => undef,
+ 		HAVE_LIBLZ4                                 => undef,
+ 		HAVE_LIBM                                   => undef,
++		HAVE_LIBNSPR4								=> undef,
++		HAVE_LIBNSS3								=> undef,
+ 		HAVE_LIBPAM                                 => undef,
+ 		HAVE_LIBREADLINE                            => undef,
+ 		HAVE_LIBSELINUX                             => undef,
+ 		HAVE_LIBSSL                                 => undef,
++		HAVE_LIBSSL3								=> undef,
+ 		HAVE_LIBWLDAP32                             => undef,
+ 		HAVE_LIBXML2                                => undef,
+ 		HAVE_LIBXSLT                                => undef,
+@@ -499,6 +502,7 @@ sub GenerateFiles
+ 		USE_LLVM                   => undef,
+ 		USE_NAMED_POSIX_SEMAPHORES => undef,
+ 		USE_OPENSSL                => undef,
++		USE_NSS                    => undef,
+ 		USE_PAM                    => undef,
+ 		USE_SLICING_BY_8_CRC32C    => undef,
+ 		USE_SSE42_CRC32C           => undef,
+@@ -559,6 +563,13 @@ sub GenerateFiles
+ 			$define{HAVE_OPENSSL_INIT_SSL}      = 1;
+ 		}
+ 	}
++	if ($self->{options}->{nss})
++	{
++		$define{USE_NSS} = 1;
++		$define{HAVE_LIBNSPR4} = 1;
++		$define{HAVE_LIBNSS3} = 1;
++		$define{HAVE_LIBSSL3} = 1;
++	}
+ 
+ 	$self->GenerateConfigHeader('src/include/pg_config.h',     \%define, 1);
+ 	$self->GenerateConfigHeader('src/include/pg_config_ext.h', \%define, 0);
+@@ -1017,6 +1028,21 @@ sub AddProject
+ 			}
+ 		}
+ 	}
++	if ($self->{options}->{nss})
++	{
++		$proj->AddIncludeDir($self->{options}->{nss} . '\..\public\nss');
++		$proj->AddIncludeDir($self->{options}->{nss} . '\include\nspr');
++		foreach my $lib (qw(plds4 plc4 nspr4))
++		{
++			$proj->AddLibrary($self->{options}->{nss} .
++							  '\lib\lib' . "$lib.lib", 0);
++		}
++		foreach my $lib (qw(ssl3 smime3 nss3))
++		{
++			$proj->AddLibrary($self->{options}->{nss} .
++							  '\lib' . "\\$lib.dll.lib", 0);
++		}
++	}
+ 	if ($self->{options}->{nls})
+ 	{
+ 		$proj->AddIncludeDir($self->{options}->{nls} . '\include');
+-- 
+2.30.1 (Apple Git-130)
+
