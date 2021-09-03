@@ -1,3 +1,38 @@
+### September 2, 2021
+
+Need to run "make clean" before switching to the NSS branch from master or vice
+versa.
+
+There's an error with `cp` in Rust coreutils: https://github.com/uutils/coreutils/issues/2631
+
+Compiling the NSS branch with:
+
+```
+LDFLAGS="-L/usr/local/opt/nss/lib -L/usr/local/opt/nspr/lib" CPPFLAGS="-I/usr/local/opt/nss/include -I/usr/local/opt/nspr/include" ./configure --prefix=$HOME/pq --with-ssl=nss && gmake && PATH=/bin:$PATH gmake install check
+```
+
+I am running into the following error:
+
+```
+gmake[5]: Entering directory '/Users/kevin/src/github.com/postgres/postgres/src/port'
+gmake[5]: Nothing to be done for 'all'.
+gmake[5]: Leaving directory '/Users/kevin/src/github.com/postgres/postgres/src/port'
+gmake -C ../../../src/common all
+gmake[5]: Entering directory '/Users/kevin/src/github.com/postgres/postgres/src/common'
+gmake[5]: Nothing to be done for 'all'.
+gmake[5]: Leaving directory '/Users/kevin/src/github.com/postgres/postgres/src/common'
+! nm -A -u libpq.5.15.dylib 2>/dev/null | grep -v __cxa_atexit | grep exit
+libpq.5.15.dylib: _exit
+gmake[4]: *** [Makefile:123: libpq-refs-stamp] Error 1
+gmake[4]: Leaving directory '/Users/kevin/src/github.com/postgres/postgres/src/interfaces/libpq'
+gmake[3]: *** [Makefile:17: install-libpq-recurse] Error 2
+gmake[3]: Leaving directory '/Users/kevin/src/github.com/postgres/postgres/src/interfaces'
+gmake[2]: *** [Makefile:42: install-interfaces-recurse] Error 2
+gmake[2]: Leaving directory '/Users/kevin/src/github.com/postgres/postgres/src'
+gmake[1]: *** [GNUmakefile:11: install-src-recurse] Error 2
+gmake[1]: Leaving directory '/Users/kevin/src/github.com/postgres/postgres'
+```
+
 ### September 1, 2021
 
 Here's a patch from Daniel Gustafsson adding libnss support to Postgres. The
