@@ -1,0 +1,21 @@
+From 8c135f1df75fe86ea11987ed044c2595bd0f0c93 Mon Sep 17 00:00:00 2001
+From: Daniel Gustafsson <daniel@yesql.se>
+Date: Mon, 8 Feb 2021 23:52:55 +0100
+Subject: [PATCH v40 10/10] nss: Build infrastructure
+
+---
+ src/interfaces/libpq/Makefile
+
+diff --git a/src/interfaces/libpq/Makefile b/src/interfaces/libpq/Makefile
+index 1fe6155e07..3a72369eaa 100644
+--- a/src/interfaces/libpq/Makefile
++++ b/src/interfaces/libpq/Makefile
+@@ -101,7 +101,7 @@ SHLIB_EXPORTS = exports.txt
+
+ PKG_CONFIG_REQUIRES_PRIVATE = libssl libcrypto
+
+-all: all-lib libpq-refs-stamp
++all: all-lib
+
+ # Shared library stuff
+ include $(top_srcdir)/src/Makefile.shlib

@@ -1,3 +1,24 @@
+### September 3, 2021
+
+Daniel Gustafsson sent a patch via email for the `_exit` issue I was running
+into:
+
+```
+diff --git a/src/interfaces/libpq/Makefile b/src/interfaces/libpq/Makefile
+index 1fe6155e07..3a72369eaa 100644
+--- a/src/interfaces/libpq/Makefile
++++ b/src/interfaces/libpq/Makefile
+@@ -101,7 +101,7 @@ SHLIB_EXPORTS = exports.txt
+
+ PKG_CONFIG_REQUIRES_PRIVATE = libssl libcrypto
+
+-all: all-lib libpq-refs-stamp
++all: all-lib
+
+ # Shared library stuff
+ include $(top_srcdir)/src/Makefile.shlib
+```
+
 ### September 2, 2021
 
 Need to run "make clean" before switching to the NSS branch from master or vice
