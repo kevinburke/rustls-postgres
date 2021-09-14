@@ -1,0 +1,3439 @@
+From 7660cb0b09ce200b19422a1b353a23eebfd40e3d Mon Sep 17 00:00:00 2001
+From: Daniel Gustafsson <daniel@yesql.se>
+Date: Mon, 8 Feb 2021 23:52:22 +0100
+Subject: [PATCH v41 01/10] nss: Support libnss as TLS library in libpq
+
+This commit contains the frontend and backend portion of TLS support
+in libpq to allow encrypted connections using NSS. The implementation
+is done as a drop-in replacement for the OpenSSL support and leverages
+the same internal API for abstracting library specific details.
+
+A new GUC, ssl_database, is used to identify the NSS database used for
+the serverside certificates and keys. The existing certificate and key
+GUCs are used for providing certificate and key nicknames.
+
+Client side there is a new connection parameter, cert_database, to
+identify the client cert and key. All existing sslmodes are supported
+in the same way as with OpenSSL.
+
+Authors: Daniel Gustafsson, Andrew Dunstan, Jacob Champion
+Reviewed-by: Michael Paquier
+---
+ .../postgres_fdw/expected/postgres_fdw.out    |    2 +-
+ src/backend/libpq/auth.c                      |    6 +
+ src/backend/libpq/be-secure-nss.c             | 1574 +++++++++++++++++
+ src/backend/libpq/be-secure.c                 |    1 +
+ src/backend/utils/misc/guc.c                  |   18 +-
+ src/common/cipher_nss.c                       |  192 ++
+ src/common/protocol_nss.c                     |   59 +
+ src/include/common/nss.h                      |   52 +
+ src/include/libpq/libpq-be.h                  |   15 +-
+ src/include/libpq/libpq.h                     |    1 +
+ src/include/pg_config_manual.h                |    2 +-
+ src/interfaces/libpq/fe-connect.c             |    4 +
+ src/interfaces/libpq/fe-secure-nss.c          | 1197 +++++++++++++
+ src/interfaces/libpq/fe-secure.c              |   21 +
+ src/interfaces/libpq/libpq-fe.h               |   11 +
+ src/interfaces/libpq/libpq-int.h              |   29 +-
+ 16 files changed, 3177 insertions(+), 7 deletions(-)
+ create mode 100644 src/backend/libpq/be-secure-nss.c
+ create mode 100644 src/common/cipher_nss.c
+ create mode 100644 src/common/protocol_nss.c
+ create mode 100644 src/include/common/nss.h
+ create mode 100644 src/interfaces/libpq/fe-secure-nss.c
+
+diff --git a/contrib/postgres_fdw/expected/postgres_fdw.out b/contrib/postgres_fdw/expected/postgres_fdw.out
+index e3ee30f1aa..e66c2cf24a 100644
+--- a/contrib/postgres_fdw/expected/postgres_fdw.out
++++ b/contrib/postgres_fdw/expected/postgres_fdw.out
+@@ -9449,7 +9449,7 @@ DO $d$
+     END;
+ $d$;
+ ERROR:  invalid option "password"
+-HINT:  Valid options in this context are: service, passfile, channel_binding, connect_timeout, dbname, host, hostaddr, port, options, application_name, keepalives, keepalives_idle, keepalives_interval, keepalives_count, tcp_user_timeout, sslmode, sslcompression, sslcert, sslkey, sslrootcert, sslcrl, sslcrldir, sslsni, requirepeer, ssl_min_protocol_version, ssl_max_protocol_version, gssencmode, krbsrvname, gsslib, target_session_attrs, use_remote_estimate, fdw_startup_cost, fdw_tuple_cost, extensions, updatable, truncatable, fetch_size, batch_size, async_capable, keep_connections
++HINT:  Valid options in this context are: service, passfile, channel_binding, connect_timeout, dbname, host, hostaddr, port, options, application_name, keepalives, keepalives_idle, keepalives_interval, keepalives_count, tcp_user_timeout, sslmode, sslcompression, sslcert, sslkey, sslrootcert, sslcrl, sslcrldir, sslsni, requirepeer, ssl_min_protocol_version, ssl_max_protocol_version, gssencmode, krbsrvname, gsslib, target_session_attrs, ssldatabase, use_remote_estimate, fdw_startup_cost, fdw_tuple_cost, extensions, updatable, truncatable, fetch_size, batch_size, async_capable, keep_connections
+ CONTEXT:  SQL statement "ALTER SERVER loopback_nopw OPTIONS (ADD password 'dummypw')"
+ PL/pgSQL function inline_code_block line 3 at EXECUTE
+ -- If we add a password for our user mapping instead, we should get a different
+diff --git a/src/backend/libpq/auth.c b/src/backend/libpq/auth.c
+index 78e1ef3e6d..87e5222b44 100644
+--- a/src/backend/libpq/auth.c
++++ b/src/backend/libpq/auth.c
+@@ -2752,7 +2752,13 @@ CheckCertAuth(Port *port)
+ 	int			status_check_usermap = STATUS_ERROR;
+ 	char	   *peer_username = NULL;
+ 
++#if defined(USE_OPENSSL)
+ 	Assert(port->ssl);
++#elif defined(USE_NSS)
++	Assert(port->pr_fd);
++#else
++	Assert(false);
++#endif
+ 
+ 	/* select the correct field to compare */
+ 	switch (port->hba->clientcertname)
+diff --git a/src/backend/libpq/be-secure-nss.c b/src/backend/libpq/be-secure-nss.c
+new file mode 100644
+index 0000000000..ef8da8b3d4
+--- /dev/null
++++ b/src/backend/libpq/be-secure-nss.c
+@@ -0,0 +1,1574 @@
++/*-------------------------------------------------------------------------
++ *
++ * be-secure-nss.c
++ *	  functions for supporting NSS as a TLS backend
++ *
++ *
++ * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
++ * Portions Copyright (c) 1994, Regents of the University of California
++ *
++ * IDENTIFICATION
++ *	  src/backend/libpq/be-secure-nss.c
++ *
++ *-------------------------------------------------------------------------
++ */
++
++#include "postgres.h"
++
++#include <sys/stat.h>
++
++#include "common/nss.h"
++
++/*
++ * The nspr/obsolete/protypes.h NSPR header typedefs uint64 and int64 with
++ * colliding definitions from ours, causing a much expected compiler error.
++ * Remove backwards compatibility with ancient NSPR versions to avoid this.
++ */
++#define NO_NSPR_10_SUPPORT
++#include <nspr/nspr.h>
++#include <nspr/prerror.h>
++#include <nspr/prio.h>
++#include <nspr/prmem.h>
++#include <nspr/prtypes.h>
++
++#include <nss/nss.h>
++#include <nss/base64.h>
++#include <nss/cert.h>
++#include <nss/certdb.h>
++#include <nss/hasht.h>
++#include <nss/keyhi.h>
++#include <nss/pk11pub.h>
++#include <nss/secder.h>
++#include <nss/secerr.h>
++#include <nss/secitem.h>
++#include <nss/secoidt.h>
++#include <nss/secport.h>
++#include <nss/ssl.h>
++#include <nss/sslerr.h>
++#include <nss/sslproto.h>
++
++#include "lib/stringinfo.h"
++#include "libpq/libpq.h"
++#include "nodes/pg_list.h"
++#include "miscadmin.h"
++#include "storage/fd.h"
++#include "utils/guc.h"
++#include "utils/memutils.h"
++
++
++/* default init hook can be overridden by a shared library */
++static void default_nss_tls_init(bool isServerStart);
++nss_tls_init_hook_type nss_tls_init_hook = default_nss_tls_init;
++
++static PRDescIdentity pr_id;
++
++static PRIOMethods pr_iomethods;
++static NSSInitContext *nss_context = NULL;
++static SSLVersionRange desired_sslver;
++
++static char *external_ssl_passphrase_cb(PK11SlotInfo *slot, PRBool retry, void *arg);
++static bool dummy_ssl_passwd_cb_called = false;
++static bool ssl_is_server_start;
++
++/*
++ * PR_ImportTCPSocket() is a private API, but very widely used, as it's the
++ * only way to make NSS use an already set up POSIX file descriptor rather
++ * than opening one itself. To quote the NSS documentation:
++ *
++ *		"In theory, code that uses PR_ImportTCPSocket may break when NSPR's
++ *		implementation changes. In practice, this is unlikely to happen because
++ *		NSPR's implementation has been stable for years and because of NSPR's
++ *		strong commitment to backward compatibility."
++ *
++ * https://developer.mozilla.org/en-US/docs/Mozilla/Projects/NSPR/Reference/PR_ImportTCPSocket
++ *
++ * The function is declared in <private/pprio.h>, but as it is a header marked
++ * private we declare it here rather than including it.
++ */
++NSPR_API(PRFileDesc *) PR_ImportTCPSocket(int);
++
++/* NSS IO layer callback overrides */
++static PRStatus pg_ssl_close(PRFileDesc *fd);
++/* Utility functions */
++static PRFileDesc *init_iolayer(Port *port);
++static uint16 ssl_protocol_version_to_nss(int v);
++
++static char *pg_SSLerrmessage(PRErrorCode errcode);
++static SECStatus pg_cert_auth_handler(void *arg, PRFileDesc *fd,
++									  PRBool checksig, PRBool isServer);
++static SECStatus pg_bad_cert_handler(void *arg, PRFileDesc *fd);
++static char *dummy_ssl_passphrase_cb(PK11SlotInfo *slot, PRBool retry, void *arg);
++static char *pg_CERT_GetDistinguishedName(CERTCertificate *cert);
++static const char *tag_to_name(SECOidTag tag);
++static SECStatus pg_SSLShutdownFunc(void *private_data, void *nss_data);
++static void pg_SSLAlertSent(const PRFileDesc *fd, void *private_data, const SSLAlert *alert);
++
++/* ------------------------------------------------------------ */
++/*						 Public interface						*/
++/* ------------------------------------------------------------ */
++
++/*
++ * be_tls_init
++ *			Initialize the nss TLS library in the postmaster
++ *
++ * The majority of the setup needs to happen in be_tls_open_server since the
++ * NSPR initialization must happen after the forking of the backend. We could
++ * potentially move some parts in under !isServerStart, but so far this is the
++ * separation chosen.
++ */
++int
++be_tls_init(bool isServerStart)
++{
++	SECStatus	status;
++	SSLVersionRange supported_sslver;
++
++	status = SSL_ConfigServerSessionIDCacheWithOpt(0, 0, NULL, 1, 0, 0, PR_FALSE);
++	if (status != SECSuccess)
++	{
++		ereport(isServerStart ? FATAL : LOG,
++				(errmsg("unable to connect to TLS connection cache: %s",
++						pg_SSLerrmessage(PR_GetError()))));
++		return -1;
++	}
++
++	if (!ssl_database || strlen(ssl_database) == 0)
++	{
++		ereport(isServerStart ? FATAL : LOG,
++				(errmsg("no certificate database specified")));
++		return -1;
++	}
++
++	/*
++	 * We check for the desired TLS version range here, even though we cannot
++	 * set it until be_open_server such that we can be compatible with how the
++	 * OpenSSL backend reports errors for incompatible range configurations.
++	 * Set either the default supported TLS version range, or the configured
++	 * range from ssl_min_protocol_version and ssl_max_protocol version. In
++	 * case the user hasn't defined the maximum allowed version we fall back
++	 * to the highest version TLS that the library supports.
++	 */
++	if (SSL_VersionRangeGetSupported(ssl_variant_stream, &supported_sslver) != SECSuccess)
++	{
++		ereport(isServerStart ? FATAL : LOG,
++				(errmsg("unable to get default protocol support from NSS")));
++		return -1;
++	}
++
++	/*
++	 * Set the fallback versions for the TLS protocol version range to a
++	 * combination of our minimal requirement and the library maximum. Error
++	 * messages should be kept identical to those in be-secure-openssl.c to
++	 * make translations easier.
++	 */
++	desired_sslver.min = SSL_LIBRARY_VERSION_TLS_1_0;
++	desired_sslver.max = supported_sslver.max;
++
++	if (ssl_min_protocol_version)
++	{
++		int			ver = ssl_protocol_version_to_nss(ssl_min_protocol_version);
++
++		if (ver == -1)
++		{
++			ereport(isServerStart ? FATAL : LOG,
++					(errmsg("\"%s\" setting \"%s\" not supported by this build",
++							"ssl_min_protocol_version",
++							GetConfigOption("ssl_min_protocol_version",
++											false, false))));
++			return -1;
++		}
++
++		if (ver > 0)
++			desired_sslver.min = ver;
++	}
++
++	if (ssl_max_protocol_version)
++	{
++		int			ver = ssl_protocol_version_to_nss(ssl_max_protocol_version);
++
++		if (ver == -1)
++		{
++			ereport(isServerStart ? FATAL : LOG,
++					(errmsg("\"%s\" setting \"%s\" not supported by this build",
++							"ssl_max_protocol_version",
++							GetConfigOption("ssl_max_protocol_version",
++											false, false))));
++			return -1;
++		}
++		if (ver > 0)
++			desired_sslver.max = ver;
++
++		if (ver < desired_sslver.min)
++		{
++			ereport(isServerStart ? FATAL : LOG,
++					(errmsg("could not set SSL protocol version range"),
++					 errdetail("\"%s\" cannot be higher than \"%s\"",
++							   "ssl_min_protocol_version",
++							   "ssl_max_protocol_version")));
++			return -1;
++		}
++	}
++
++	/*
++	 * Set the passphrase callback which will be used both to obtain the
++	 * passphrase from the user, as well as by NSS to obtain the phrase
++	 * repeatedly.
++	 */
++	ssl_is_server_start = isServerStart;
++	(*nss_tls_init_hook) (isServerStart);
++
++	return 0;
++}
++
++/*
++ * be_tls_open_server
++ *
++ * Since NSPR initialization must happen after forking, most of the actual
++ * setup of NSPR/NSS is done here rather than in be_tls_init. This introduce
++ * differences with the OpenSSL support where some errors are only reported
++ * at runtime with NSS where they are reported at startup with OpenSSL.
++ */
++int
++be_tls_open_server(Port *port)
++{
++	SECStatus	status;
++	PRFileDesc *model;
++	PRFileDesc *layer;
++	CERTCertificate *server_cert;
++	SECKEYPrivateKey *private_key;
++	CERTSignedCrl *crl;
++	SECItem		crlname;
++	char	   *cert_database;
++	NSSInitParameters params;
++
++	/*
++	 * The NSPR documentation states that runtime initialization via PR_Init
++	 * is no longer required, as the first caller into NSPR will perform the
++	 * initialization implicitly. The documentation doesn't however clarify
++	 * from which version this is holds true, so let's perform the potentially
++	 * superfluous initialization anyways to avoid crashing on older versions
++	 * of NSPR, as there is no difference in overhead.  The NSS documentation
++	 * still states that PR_Init must be called in some way (implicitly or
++	 * explicitly).
++	 *
++	 * The below parameters are what the implicit initialization would've done
++	 * for us, and should work even for older versions where it might not be
++	 * done automatically. The last parameter, maxPTDs, is set to various
++	 * values in other codebases, but has been unused since NSPR 2.1 which was
++	 * released sometime in 1998. In current versions of NSPR all parameters
++	 * are ignored.
++	 */
++	PR_Init(PR_USER_THREAD, PR_PRIORITY_NORMAL, 0 /* maxPTDs */ );
++
++	/*
++	 * The certificate path (configdir) must contain a valid NSS database. If
++	 * the certificate path isn't a valid directory, NSS will fall back on the
++	 * system certificate database. If the certificate path is a directory but
++	 * is empty then the initialization will fail. On the client side this can
++	 * be allowed for any sslmode but the verify-xxx ones.
++	 * https://bugzilla.redhat.com/show_bug.cgi?id=728562 For the server side
++	 * we won't allow this to fail however, as we require the certificate and
++	 * key to exist.
++	 *
++	 * The original design of NSS was for a single application to use a single
++	 * copy of it, initialized with NSS_Initialize() which isn't returning any
++	 * handle with which to refer to NSS. NSS initialization and shutdown are
++	 * global for the application, so a shutdown in another NSS enabled
++	 * library would cause NSS to be stopped for libpq as well.  The fix has
++	 * been to introduce NSS_InitContext which returns a context handle to
++	 * pass to NSS_ShutdownContext.  NSS_InitContext was introduced in NSS
++	 * 3.12, but the use of it is not very well documented.
++	 * https://bugzilla.redhat.com/show_bug.cgi?id=738456
++	 *
++	 * The InitParameters struct passed can be used to override internal
++	 * values in NSS, but the usage is not documented at all. When using
++	 * NSS_Init initializations, the values are instead set via PK11_Configure
++	 * calls so the PK11_Configure documentation can be used to glean some
++	 * details on these.
++	 *
++	 * https://developer.mozilla.org/en-US/docs/Mozilla/Projects/NSS/PKCS11/Module_Specs
++	 */
++	memset(&params, '\0', sizeof(params));
++	params.length = sizeof(params);
++
++	if (!ssl_database || strlen(ssl_database) == 0)
++		ereport(FATAL,
++				(errmsg("no certificate database specified")));
++
++	cert_database = psprintf("sql:%s", ssl_database);
++	nss_context = NSS_InitContext(cert_database, "", "", "",
++								  &params,
++								  NSS_INIT_READONLY | NSS_INIT_PK11RELOAD);
++	pfree(cert_database);
++
++	if (!nss_context)
++		ereport(FATAL,
++				(errmsg("unable to read certificate database \"%s\": %s",
++						ssl_database, pg_SSLerrmessage(PR_GetError()))));
++
++	/*
++	 * Import the already opened socket as we don't want to use NSPR functions
++	 * for opening the network socket due to how the PostgreSQL protocol works
++	 * with TLS connections. This function is not part of the NSPR public API,
++	 * see the comment at the top of the file for the rationale of still using
++	 * it.
++	 */
++	port->pr_fd = PR_ImportTCPSocket(port->sock);
++	if (!port->pr_fd)
++	{
++		ereport(COMMERROR,
++				(errmsg("unable to connect to socket")));
++		return -1;
++	}
++
++	/*
++	 * Most of the documentation available, and implementations of, NSS/NSPR
++	 * use the PR_NewTCPSocket() function here, which has the drawback that it
++	 * can only create IPv4 sockets. Instead use PR_OpenTCPSocket() which
++	 * copes with IPv6 as well.
++	 *
++	 * We use a model filedescriptor here which is a construct in NSPR/NSS in
++	 * order to create a configuration template for sockets which can then be
++	 * applied to new sockets created. This makes more sense in a server which
++	 * accepts multiple connections and want to perform the boilerplate just
++	 * once, but it does provide a nice abstraction here as well in that we
++	 * can error out early without having performed any operation on the real
++	 * socket.
++	 */
++	model = PR_OpenTCPSocket(port->laddr.addr.ss_family);
++	if (!model)
++	{
++		ereport(COMMERROR,
++				(errmsg("unable to open socket")));
++		return -1;
++	}
++
++	/*
++	 * Convert the NSPR socket to an SSL socket. Ensuring the success of this
++	 * operation is critical as NSS SSL_* functions may return SECSuccess on
++	 * the socket even though SSL hasn't been enabled, which introduce a risk
++	 * of silent downgrades.
++	 */
++	model = SSL_ImportFD(NULL, model);
++	if (!model)
++	{
++		ereport(COMMERROR,
++				(errmsg("unable to enable TLS on socket")));
++		return -1;
++	}
++
++	/*
++	 * Configure basic settings for the connection over the SSL socket in
++	 * order to set it up as a server.
++	 */
++	if (SSL_OptionSet(model, SSL_SECURITY, PR_TRUE) != SECSuccess)
++	{
++		ereport(COMMERROR,
++				(errmsg("unable to configure TLS connection")));
++		return -1;
++	}
++
++	if (SSL_OptionSet(model, SSL_HANDSHAKE_AS_SERVER, PR_TRUE) != SECSuccess ||
++		SSL_OptionSet(model, SSL_HANDSHAKE_AS_CLIENT, PR_FALSE) != SECSuccess)
++	{
++		ereport(COMMERROR,
++				(errmsg("unable to configure TLS connection as server")));
++		return -1;
++	}
++
++	/*
++	 * SSLv2 is disabled by default, and SSLv3 will be excluded from the range
++	 * of allowed protocols further down. Since we really don't want these to
++	 * ever be enabled, let's use belts and suspenders and explicitly turn
++	 * them off as well.
++	 */
++	SSL_OptionSet(model, SSL_ENABLE_SSL2, PR_FALSE);
++	SSL_OptionSet(model, SSL_ENABLE_SSL3, PR_FALSE);
++
++#ifdef SSL_CBC_RANDOM_IV
++
++	/*
++	 * Enable protection against the BEAST attack in case the NSS server has
++	 * support for that. While SSLv3 is disabled, we may still allow TLSv1
++	 * which is affected. The option isn't documented as an SSL option, but as
++	 * an NSS environment variable.
++	 */
++	SSL_OptionSet(model, SSL_CBC_RANDOM_IV, PR_TRUE);
++#endif
++
++	/*
++	 * Configure the allowed ciphers. If there are no user preferred suites,
++	 * set the domestic policy.
++	 *
++	 * Historically there were different cipher policies based on export (and
++	 * import) restrictions: Domestic, Export and France. These are since long
++	 * removed with all ciphers being enabled by default. Due to backwards
++	 * compatibility, the old API is still used even though all three policies
++	 * now do the same thing.
++	 *
++	 * If SSLCipherSuites define a policy of the user, we set that rather than
++	 * enabling all ciphers via NSS_SetDomesticPolicy.
++	 *
++	 * TODO: while this code works, the set of ciphers which can be set and
++	 * still end up with a working socket is woefully underdocumented for
++	 * anything more recent than SSLv3 (the code for TLS actually calls ssl3
++	 * functions under the hood for SSL_CipherPrefSet), so it's unclear if
++	 * this is helpful or not. Using the policies works, but may be too
++	 * coarsely grained.
++	 *
++	 * Another TODO: The SSL_ImplementedCiphers table returned with calling
++	 * SSL_GetImplementedCiphers is sorted in server preference order. Sorting
++	 * SSLCipherSuites according to the order of the ciphers therein could be
++	 * a way to implement ssl_prefer_server_ciphers - if we at all want to use
++	 * cipher selection for NSS like how we do it for OpenSSL that is.
++	 */
++
++	/*
++	 * If no ciphers are specified, enable them all.
++	 */
++	if (!SSLCipherSuites || strlen(SSLCipherSuites) == 0)
++	{
++		status = NSS_SetDomesticPolicy();
++		if (status != SECSuccess)
++		{
++			ereport(COMMERROR,
++					(errmsg("unable to set cipher policy: %s",
++							pg_SSLerrmessage(PR_GetError()))));
++			return -1;
++		}
++	}
++	else
++	{
++		char	   *ciphers,
++				   *c;
++
++		char	   *sep = ":;, ";
++		PRUint16	ciphercode;
++		const		PRUint16 *nss_ciphers;
++		bool		found = false;
++
++		/*
++		 * If the user has specified a set of preferred cipher suites we start
++		 * by turning off all the existing suites to avoid the risk of down-
++		 * grades to a weaker cipher than expected.
++		 */
++		nss_ciphers = SSL_GetImplementedCiphers();
++		for (int i = 0; i < SSL_GetNumImplementedCiphers(); i++)
++			SSL_CipherPrefSet(model, nss_ciphers[i], PR_FALSE);
++
++		ciphers = pstrdup(SSLCipherSuites);
++
++		for (c = strtok(ciphers, sep); c; c = strtok(NULL, sep))
++		{
++			if (pg_find_cipher(c, &ciphercode))
++			{
++				status = SSL_CipherPrefSet(model, ciphercode, PR_TRUE);
++				found = true;
++				if (status != SECSuccess)
++				{
++					ereport(COMMERROR,
++							(errmsg("invalid cipher-suite specified: %s", c)));
++					return -1;
++				}
++			}
++		}
++
++		pfree(ciphers);
++
++		if (!found)
++		{
++			ereport(COMMERROR,
++					(errmsg("no cipher-suites found")));
++			return -1;
++		}
++	}
++
++	if (SSL_VersionRangeSet(model, &desired_sslver) != SECSuccess)
++	{
++		ereport(COMMERROR,
++				(errmsg("unable to set requested SSL protocol version range")));
++		return -1;
++	}
++
++	/*
++	 * Set up the custom IO layer in order to be able to provide custom call-
++	 * backs for IO operations which override the built-in behavior. For now
++	 * we need this in order to support debug builds of NSS/NSPR.
++	 */
++	layer = init_iolayer(port);
++	if (!layer)
++		return -1;
++
++	if (PR_PushIOLayer(port->pr_fd, PR_TOP_IO_LAYER, layer) != PR_SUCCESS)
++	{
++		PR_Close(layer);
++		ereport(COMMERROR,
++				(errmsg("unable to push IO layer")));
++		return -1;
++	}
++
++	server_cert = PK11_FindCertFromNickname(ssl_cert_file, (void *) port);
++	if (!server_cert)
++	{
++		if (dummy_ssl_passwd_cb_called)
++		{
++			ereport(COMMERROR,
++					(errmsg("unable to load certificate for \"%s\": %s",
++							ssl_cert_file, pg_SSLerrmessage(PR_GetError())),
++					 errhint("The certificate requires a password.")));
++			return -1;
++		}
++		else
++		{
++			ereport(COMMERROR,
++					(errmsg("unable to find certificate for \"%s\": %s",
++							ssl_cert_file, pg_SSLerrmessage(PR_GetError()))));
++			return -1;
++		}
++	}
++
++	private_key = PK11_FindKeyByAnyCert(server_cert, (void *) port);
++	if (!private_key)
++	{
++		if (dummy_ssl_passwd_cb_called)
++		{
++			ereport(COMMERROR,
++					(errmsg("unable to load private key for \"%s\": %s",
++							ssl_cert_file, pg_SSLerrmessage(PR_GetError())),
++					 errhint("The private key requires a password.")));
++			return -1;
++		}
++		else
++		{
++			ereport(COMMERROR,
++					(errmsg("unable to find private key for \"%s\": %s",
++							ssl_cert_file, pg_SSLerrmessage(PR_GetError()))));
++			return -1;
++		}
++	}
++
++	/*
++	 * NSS doesn't use CRL files on disk, so we use the ssl_crl_file guc to
++	 * contain the CRL nickname for the current server certificate in the NSS
++	 * certificate database. The main difference from the OpenSSL backend is
++	 * that NSS will use the CRL regardless, but being able to make sure the
++	 * CRL is loaded seems like a good feature.
++	 */
++	if (ssl_crl_file[0])
++	{
++		SECITEM_CopyItem(NULL, &crlname, &server_cert->derSubject);
++		crl = SEC_FindCrlByName(CERT_GetDefaultCertDB(), &crlname, SEC_CRL_TYPE);
++		if (!crl)
++		{
++			ereport(COMMERROR,
++					(errmsg("specified CRL not found in database")));
++			return -1;
++		}
++		SEC_DestroyCrl(crl);
++	}
++
++	/*
++	 * Finally we must configure the socket for being a server by setting the
++	 * certificate and key. The NULL parameter is an SSLExtraServerCertData
++	 * pointer with the final parameter being the size of the extra server
++	 * cert data structure pointed to. This is typically only used for
++	 * credential delegation.
++	 */
++	status = SSL_ConfigServerCert(model, server_cert, private_key, NULL, 0);
++	if (status != SECSuccess)
++	{
++		ereport(COMMERROR,
++				(errmsg("unable to configure server for TLS server connections: %s",
++						pg_SSLerrmessage(PR_GetError()))));
++		return -1;
++	}
++
++	ssl_loaded_verify_locations = true;
++
++	/*
++	 * At this point, we no longer have use for the certificate and private
++	 * key as they have been copied into the context by NSS. Destroy our
++	 * copies explicitly to clean out the memory as best we can.
++	 */
++	CERT_DestroyCertificate(server_cert);
++	SECKEY_DestroyPrivateKey(private_key);
++
++	/* Set up certificate authentication callback */
++	status = SSL_AuthCertificateHook(model, pg_cert_auth_handler, (void *) port);
++	if (status != SECSuccess)
++	{
++		ereport(COMMERROR,
++				(errmsg("unable to install authcert hook: %s",
++						pg_SSLerrmessage(PR_GetError()))));
++		return -1;
++	}
++	SSL_BadCertHook(model, pg_bad_cert_handler, (void *) port);
++	SSL_OptionSet(model, SSL_REQUEST_CERTIFICATE, PR_TRUE);
++	SSL_OptionSet(model, SSL_REQUIRE_CERTIFICATE, PR_FALSE);
++
++	/*
++	 * Apply the configuration from the model template onto our actual socket
++	 * to set it up as a TLS server.
++	 */
++	port->pr_fd = SSL_ImportFD(model, port->pr_fd);
++	if (!port->pr_fd)
++	{
++		ereport(COMMERROR,
++				(errmsg("unable to configure socket for TLS server mode: %s",
++						pg_SSLerrmessage(PR_GetError()))));
++		return -1;
++	}
++
++	/*
++	 * The intention with the model FD is to keep it as a template for coming
++	 * connections to amortize the cost and complexity across all client
++	 * sockets. Since we won't get another socket connected in this backend
++	 * we can however close the model immediately.
++	 */
++	PR_Close(model);
++
++	/*
++	 * Force a handshake on the next I/O request, the second parameter means
++	 * that we are a server, PR_FALSE would indicate being a client. NSPR
++	 * requires us to call SSL_ResetHandshake since we imported an already
++	 * established socket.
++	 */
++	status = SSL_ResetHandshake(port->pr_fd, PR_TRUE);
++	if (status != SECSuccess)
++	{
++		ereport(COMMERROR,
++				(errmsg("unable to initiate handshake: %s",
++						pg_SSLerrmessage(PR_GetError()))));
++		return -1;
++	}
++	status = SSL_ForceHandshake(port->pr_fd);
++	if (status != SECSuccess)
++	{
++		ereport(COMMERROR,
++				(errmsg("unable to handshake: %s",
++						pg_SSLerrmessage(PR_GetError()))));
++		return -1;
++	}
++
++	port->ssl_in_use = true;
++
++	/* Register our shutdown callback */
++	NSS_RegisterShutdown(pg_SSLShutdownFunc, port);
++
++	/* Register callback for TLS alerts */
++	SSL_AlertSentCallback(port->pr_fd, pg_SSLAlertSent, port);
++
++	return 0;
++}
++
++ssize_t
++be_tls_read(Port *port, void *ptr, size_t len, int *waitfor)
++{
++	ssize_t		n_read;
++	PRErrorCode err;
++
++	n_read = PR_Read(port->pr_fd, ptr, len);
++
++	if (n_read < 0)
++	{
++		err = PR_GetError();
++
++		if (err == PR_WOULD_BLOCK_ERROR)
++		{
++			*waitfor = WL_SOCKET_READABLE;
++			errno = EWOULDBLOCK;
++		}
++		else
++			errno = ECONNRESET;
++	}
++
++	return n_read;
++}
++
++ssize_t
++be_tls_write(Port *port, void *ptr, size_t len, int *waitfor)
++{
++	ssize_t		n_write;
++	PRErrorCode err;
++	PRIntn		flags = 0;
++
++	/*
++	 * The flags parameter to PR_Send is no longer used and is, according to
++	 * the documentation, required to be zero.
++	 */
++	n_write = PR_Send(port->pr_fd, ptr, len, flags, PR_INTERVAL_NO_WAIT);
++
++	if (n_write < 0)
++	{
++		err = PR_GetError();
++
++		if (err == PR_WOULD_BLOCK_ERROR)
++		{
++			*waitfor = WL_SOCKET_WRITEABLE;
++			errno = EWOULDBLOCK;
++		}
++		else
++			errno = ECONNRESET;
++	}
++
++	return n_write;
++}
++
++/*
++ * be_tls_close
++ *
++ * Callback for closing down the current connection, if any.
++ */
++void
++be_tls_close(Port *port)
++{
++	if (!port)
++		return;
++	/*
++	 * Immediately signal to the rest of the backend that this connnection is
++	 * no longer to be considered to be using TLS encryption.
++	 */
++	port->ssl_in_use = false;
++
++	if (port->peer_cn)
++	{
++		SSL_InvalidateSession(port->pr_fd);
++		pfree(port->peer_cn);
++		port->peer_cn = NULL;
++	}
++
++	PR_Close(port->pr_fd);
++	port->pr_fd = NULL;
++
++	if (nss_context)
++	{
++		NSS_ShutdownContext(nss_context);
++		nss_context = NULL;
++	}
++}
++
++/*
++ * be_tls_destroy
++ *
++ * Callback for destroying global contexts during SIGHUP.
++ */
++void
++be_tls_destroy(void)
++{
++	/*
++	 * It reads a bit odd to clear a session cache when we are destroying the
++	 * context altogether, but if the session cache isn't cleared before
++	 * shutting down the context it will fail with SEC_ERROR_BUSY.
++	 */
++	SSL_ClearSessionCache();
++}
++
++/*
++ * be_tls_get_cipher_bits
++ *
++ * Returns the number of bits in the encryption key used, or zero in case
++ * of errors.
++ */
++int
++be_tls_get_cipher_bits(Port *port)
++{
++	SECStatus	status;
++	SSLChannelInfo channel;
++	SSLCipherSuiteInfo suite;
++
++	status = SSL_GetChannelInfo(port->pr_fd, &channel, sizeof(channel));
++	if (status != SECSuccess)
++		goto error;
++
++	status = SSL_GetCipherSuiteInfo(channel.cipherSuite, &suite, sizeof(suite));
++	if (status != SECSuccess)
++		goto error;
++
++	return suite.effectiveKeyBits;
++
++error:
++	ereport(WARNING,
++			(errmsg("unable to extract TLS session information: %s",
++					pg_SSLerrmessage(PR_GetError()))));
++	return 0;
++}
++
++/*
++ * be_tls_get_version
++ *
++ * Returns the protocol version used for the current connection, or NULL in
++ * case of errors.
++ */
++const char *
++be_tls_get_version(Port *port)
++{
++	SECStatus	status;
++	SSLChannelInfo channel;
++
++	status = SSL_GetChannelInfo(port->pr_fd, &channel, sizeof(channel));
++	if (status != SECSuccess)
++	{
++		ereport(WARNING,
++				(errmsg("unable to extract TLS session information: %s",
++						pg_SSLerrmessage(PR_GetError()))));
++		return NULL;
++	}
++
++	return ssl_protocol_version_to_string(channel.protocolVersion);
++}
++
++/*
++ * be_tls_get_cipher
++ *
++ * Returns the cipher used for the current connection, or NULL in case of
++ * errors.
++ */
++const char *
++be_tls_get_cipher(Port *port)
++{
++	SECStatus	status;
++	SSLChannelInfo channel;
++	SSLCipherSuiteInfo suite;
++
++	status = SSL_GetChannelInfo(port->pr_fd, &channel, sizeof(channel));
++	if (status != SECSuccess)
++		goto error;
++
++	status = SSL_GetCipherSuiteInfo(channel.cipherSuite, &suite, sizeof(suite));
++	if (status != SECSuccess)
++		goto error;
++
++	return suite.cipherSuiteName;
++
++error:
++	ereport(WARNING,
++			(errmsg("unable to extract TLS session information: %s",
++					pg_SSLerrmessage(PR_GetError()))));
++	return NULL;
++}
++
++/*
++ * be_tls_get_peer_subject_name
++ *
++ * Returns the subject name of the peer certificate.
++ */
++void
++be_tls_get_peer_subject_name(Port *port, char *ptr, size_t len)
++{
++	CERTCertificate *certificate;
++
++	certificate = SSL_PeerCertificate(port->pr_fd);
++	if (certificate)
++		strlcpy(ptr, CERT_NameToAscii(&certificate->subject), len);
++	else
++		ptr[0] = '\0';
++}
++
++/*
++ * be_tls_get_peer_issuer_name
++ *
++ * Returns the issuer name of the peer certificate.
++ */
++void
++be_tls_get_peer_issuer_name(Port *port, char *ptr, size_t len)
++{
++	CERTCertificate *certificate;
++
++	certificate = SSL_PeerCertificate(port->pr_fd);
++	if (certificate)
++		strlcpy(ptr, CERT_NameToAscii(&certificate->issuer), len);
++	else
++		ptr[0] = '\0';
++}
++
++/*
++ * be_tls_get_peer_serial
++ *
++ * Returns the serial of the peer certificate.
++ */
++void
++be_tls_get_peer_serial(Port *port, char *ptr, size_t len)
++{
++	CERTCertificate *certificate;
++
++	certificate = SSL_PeerCertificate(port->pr_fd);
++	if (certificate)
++		snprintf(ptr, len, "%li", DER_GetInteger(&(certificate->serialNumber)));
++	else
++		ptr[0] = '\0';
++}
++
++/*
++ * be_tls_get_certificate_hash
++ *
++ * Returns the hash data of the server certificate for SCRAM channel binding.
++ */
++char *
++be_tls_get_certificate_hash(Port *port, size_t *len)
++{
++	CERTCertificate *certificate;
++	SECOidTag	signature_tag;
++	SECOidTag	digest_alg;
++	int			digest_len;
++	SECStatus	status;
++	PLArenaPool *arena = NULL;
++	SECItem		digest;
++	char	   *ret;
++	PK11Context *ctx = NULL;
++	unsigned int outlen;
++
++	*len = 0;
++	certificate = SSL_LocalCertificate(port->pr_fd);
++	if (!certificate)
++		return NULL;
++
++	signature_tag = SECOID_GetAlgorithmTag(&certificate->signature);
++	if (!pg_find_signature_algorithm(signature_tag, &digest_alg, &digest_len))
++		elog(ERROR, "could not find digest for OID '%s'",
++			 SECOID_FindOIDTagDescription(signature_tag));
++
++	/*
++	 * The TLS server's certificate bytes need to be hashed with SHA-256 if
++	 * its signature algorithm is MD5 or SHA-1 as per RFC 5929
++	 * (https://tools.ietf.org/html/rfc5929#section-4.1).  If something else
++	 * is used, the same hash as the signature algorithm is used.
++	 */
++	if (digest_alg == SEC_OID_SHA1 || digest_alg == SEC_OID_MD5)
++	{
++		digest_alg = SEC_OID_SHA256;
++		digest_len = SHA256_LENGTH;
++	}
++
++	ctx = PK11_CreateDigestContext(digest_alg);
++	if (!ctx)
++		elog(ERROR, "out of memory");
++
++	arena = PORT_NewArena(SEC_ASN1_DEFAULT_ARENA_SIZE);
++	digest.data = PORT_ArenaZAlloc(arena, sizeof(unsigned char) * digest_len);
++	if (!digest.data)
++		elog(ERROR, "out of memory");
++	digest.len = digest_len;
++
++	status = SECSuccess;
++	status |= PK11_DigestBegin(ctx);
++	status |= PK11_DigestOp(ctx, certificate->derCert.data, certificate->derCert.len);
++	status |= PK11_DigestFinal(ctx, digest.data, &outlen, digest_len);
++
++	if (status != SECSuccess)
++	{
++		PORT_FreeArena(arena, PR_TRUE);
++		PK11_DestroyContext(ctx, PR_TRUE);
++		elog(ERROR, "could not generate server certificate hash");
++	}
++
++	ret = palloc(digest.len);
++	memcpy(ret, digest.data, digest.len);
++	*len = digest_len;
++
++	PORT_FreeArena(arena, PR_TRUE);
++	PK11_DestroyContext(ctx, PR_TRUE);
++
++	return ret;
++}
++
++/* ------------------------------------------------------------ */
++/*						Internal functions						*/
++/* ------------------------------------------------------------ */
++
++/*
++ * default_nss_tls_init
++ *
++ * The default TLS init hook function which users can override for installing
++ * their own passphrase callbacks and similar actions. In case no callback has
++ * been configured, or the callback isn't reload capable during a server
++ * reload, the dummy callback will be installed.
++ *
++ * The private data for the callback is set differently depending on how it's
++ * invoked. For calls which may invoke the callback deeper in the callstack
++ * the private data is set with SSL_SetPKCS11PinArg. When the call is directly
++ * invoking the callback, like PK11_FindCertFromNickname, then the private
++ * data is passed as a parameter. Setting the data with SSL_SetPKCS11PinArg is
++ * thus not required but good practice.
++ *
++ * NSS doesn't provide a default callback like OpenSSL does, but a callback is
++ * required to be set.  The password callback can be installed at any time, but
++ * setting the private data with SSL_SetPKCS11PinArg requires a PR Filedesc.
++ */
++static void
++default_nss_tls_init(bool isServerStart)
++{
++	/*
++	 * No user-defined callback has been configured, install the dummy call-
++	 * back since we must set something.
++	 */
++	if (!ssl_passphrase_command[0])
++		PK11_SetPasswordFunc(dummy_ssl_passphrase_cb);
++	else
++	{
++		/*
++		 * There is a user-defined callback, set it unless we are in a restart
++		 * and cannot handle restarts due to an interactive callback.
++		 */
++		if (isServerStart)
++			PK11_SetPasswordFunc(external_ssl_passphrase_cb);
++		else
++		{
++			if (ssl_passphrase_command_supports_reload)
++				PK11_SetPasswordFunc(external_ssl_passphrase_cb);
++			else
++				PK11_SetPasswordFunc(dummy_ssl_passphrase_cb);
++		}
++	}
++}
++
++/*
++ * external_ssl_passphrase_cb
++ *
++ * Runs the callback configured by ssl_passphrase_command and returns the
++ * captured password back to NSS.
++ */
++static char *
++external_ssl_passphrase_cb(PK11SlotInfo *slot, PRBool retry, void *arg)
++{
++	/*
++	 * NSS use a hardcoded 256 byte buffer for reading the password so set the
++	 * same limit for our callback buffer.
++	 */
++	char		buf[256];
++	int			len;
++	char	   *password = NULL;
++	char	   *prompt;
++
++	/*
++	 * Since there is no password callback in NSS when the server starts up,
++	 * it makes little sense to create an interactive callback. Thus, if this
++	 * is a retry attempt then give up immediately.
++	 */
++	if (retry)
++		return NULL;
++
++	/*
++	 * Construct the same prompt that NSS uses internally even though it is
++	 * unlikely to serve much purpose, but we must set a prompt so we might as
++	 * well do it right.
++	 */
++	prompt = psprintf("Enter Password or Pin for \"%s\":",
++					  PK11_GetTokenName(slot));
++
++	len = run_ssl_passphrase_command(prompt, ssl_is_server_start, buf, sizeof(buf));
++	pfree(prompt);
++
++	if (!len)
++		return NULL;
++
++	/*
++	 * At least one byte with password content was returned, and NSS requires
++	 * that we return it allocated in NSS controlled memory. If we fail to
++	 * allocate then abort without passing back NULL and bubble up the error
++	 * on the PG side.
++	 */
++	password = (char *) PR_Malloc(len + 1);
++	if (!password)
++	{
++		explicit_bzero(buf, sizeof(buf));
++		ereport(ERROR,
++				(errcode(ERRCODE_OUT_OF_MEMORY),
++				 errmsg("out of memory")));
++	}
++	strlcpy(password, buf, sizeof(password));
++	explicit_bzero(buf, sizeof(buf));
++
++	return password;
++}
++
++/*
++ * dummy_ssl_passphrase_cb
++ *
++ * Return unsuccessful if we are asked to provide the passphrase for a cert or
++ * key, without having a passphrase callback installed.
++ */
++static char *
++dummy_ssl_passphrase_cb(PK11SlotInfo *slot, PRBool retry, void *arg)
++{
++	dummy_ssl_passwd_cb_called = true;
++	return NULL;
++}
++
++/*
++ * pg_bad_cert_handler
++ *
++ * Callback for handling certificate validation failure during handshake. It's
++ * called from SSL_AuthCertificate during failure cases.
++ */
++static SECStatus
++pg_bad_cert_handler(void *arg, PRFileDesc *fd)
++{
++	Port	   *port = (Port *) arg;
++
++	port->peer_cert_valid = false;
++	return SECFailure;
++}
++
++/*
++ * tag_to_name
++ *
++ * Return the name of the RDN identified by the tag passed as parameter. NSS
++ * has this information in a struct, but the only publicly accessible API for
++ * using it is limited to retrieving the maximum length of the ava.
++ */
++static const char *
++tag_to_name(SECOidTag tag)
++{
++	switch(tag)
++	{
++		case SEC_OID_AVA_COMMON_NAME:
++			return "CN";
++		case SEC_OID_AVA_STATE_OR_PROVINCE:
++			return "ST";
++		case SEC_OID_AVA_ORGANIZATION_NAME:
++			return "O";
++		case SEC_OID_AVA_ORGANIZATIONAL_UNIT_NAME:
++			return "OU";
++		case SEC_OID_AVA_COUNTRY_NAME:
++			return "C";
++		case SEC_OID_AVA_LOCALITY:
++			return "L";
++		case SEC_OID_AVA_SURNAME:
++			return "SN";
++		case SEC_OID_AVA_DC:
++			return "DC";
++		case SEC_OID_RFC1274_MAIL:
++			return "MAIL";
++		case SEC_OID_RFC1274_UID:
++			return "UID";
++		/*
++		 * TODO: what would be the most appropriate thing to do here?
++		 */
++		default:
++			return "";
++	}
++}
++
++/*
++ * pg_CERT_GetDistinguishedName
++ *
++ * NSS doesn't provide a DN equivalent of CERT_GetCommonName, so we have to
++ * keep our own.
++ */
++static char *
++pg_CERT_GetDistinguishedName(CERTCertificate *cert)
++{
++	CERTName		subject = cert->subject;
++	CERTRDN		  **rdn;
++	StringInfoData	dnbuf;
++	char		   *dn = NULL;
++
++	initStringInfo(&dnbuf);
++
++	for (rdn = subject.rdns; *rdn; rdn++)
++	{
++		CERTAVA   **ava;
++		bool		first = true;
++
++		for (ava = (*rdn)->avas; *ava; ava++)
++		{
++			SECItem	   *buf;
++			SECStatus	status;
++			char	   *tmpstr;
++			char	   *dststr;
++			int			tmplen;
++
++			/* See raw_subject_common_name comment for discussion */
++			buf = CERT_DecodeAVAValue(&(*ava)->value);
++			if (!buf)
++				return NULL;
++
++			tmpstr = palloc0(buf->len + 1);
++			tmplen = buf->len;
++			memcpy(tmpstr, buf->data, buf->len);
++			SECITEM_FreeItem(buf, PR_TRUE);
++			/* Check for embedded null */
++			if (strlen(tmpstr) != tmplen)
++				return NULL;
++
++			/* Make room for the worst case escaping */
++			dststr = palloc0((tmplen * 3) + 1);
++
++			/*
++			 * While the function name refers to RFC 1485, the underlying
++			 * quoting code conforms to the RFC 2253 rules.
++			 */
++			status = CERT_RFC1485_EscapeAndQuote(dststr, tmplen * 3, tmpstr, tmplen);
++			if (status != SECSuccess)
++			{
++				pfree(dststr);
++				pfree(tmpstr);
++				return NULL;
++			}
++
++			appendStringInfo(&dnbuf, "%s%s=%s",
++							 (first ? "" : ","),
++							 tag_to_name(CERT_GetAVATag(*ava)), dststr);
++			first = false;
++
++			pfree(dststr);
++			pfree(tmpstr);
++		}
++	}
++
++	if (dnbuf.len)
++	{
++		dn = MemoryContextAllocZero(TopMemoryContext, dnbuf.len + 1);
++		strlcpy(dn, dnbuf.data, dnbuf.len + 1);
++	}
++
++	return dn;
++}
++
++/*
++ * raw_subject_common_name
++ *
++ * Returns the Subject Common Name for the given certificate as a raw char
++ * buffer (that is, without any form of escaping for unprintable characters or
++ * embedded nulls), with the length of the buffer returned in the len param.
++ * The buffer is allocated in the TopMemoryContext and is given a NULL
++ * terminator so that callers are safe to call strlen() on it.
++ *
++ * This is used instead of CERT_GetCommonName(), which always performs quoting
++ * and/or escaping. NSS doesn't appear to give us a way to easily unescape the
++ * result, and we need to store the raw CN into port->peer_cn for compatibility
++ * with the OpenSSL implementation.
++ */
++static char *
++raw_subject_common_name(CERTCertificate *cert, unsigned int *len)
++{
++	CERTName	subject = cert->subject;
++	CERTRDN	  **rdn;
++
++	for (rdn = subject.rdns; *rdn; rdn++)
++	{
++		CERTAVA	  **ava;
++
++		for (ava = (*rdn)->avas; *ava; ava++)
++		{
++			SECItem	   *buf;
++			char	   *cn;
++
++			if (CERT_GetAVATag(*ava) != SEC_OID_AVA_COMMON_NAME)
++				continue;
++
++			/* Found a CN, decode and copy it into a newly allocated buffer */
++			buf = CERT_DecodeAVAValue(&(*ava)->value);
++			if (!buf)
++			{
++				/*
++				 * This failure case is difficult to test. (Since this code
++				 * runs after certificate authentication has otherwise
++				 * succeeded, you'd need to convince a CA implementation to
++				 * sign a corrupted certificate in order to get here.)
++				 *
++				 * Follow the behavior of CERT_GetCommonName() in this case and
++				 * simply return NULL, as if a Common Name had not been found.
++				 */
++				goto fail;
++			}
++
++			cn = MemoryContextAlloc(TopMemoryContext, buf->len + 1);
++			memcpy(cn, buf->data, buf->len);
++			cn[buf->len] = '\0';
++
++			*len = buf->len;
++
++			SECITEM_FreeItem(buf, PR_TRUE);
++			return cn;
++		}
++	}
++
++fail:
++	/* Not found  */
++	*len = 0;
++	return NULL;
++}
++
++/*
++ * pg_cert_auth_handler
++ *
++ * Callback for validation of incoming certificates. Returning SECFailure will
++ * cause NSS to terminate the connection immediately.
++ */
++static SECStatus
++pg_cert_auth_handler(void *arg, PRFileDesc *fd, PRBool checksig, PRBool isServer)
++{
++	SECStatus	status;
++	Port	   *port = (Port *) arg;
++	CERTCertificate *cert;
++	char	   *peer_cn;
++	unsigned int len;
++
++	status = SSL_AuthCertificate(CERT_GetDefaultCertDB(), port->pr_fd, checksig, PR_TRUE);
++	if (status != SECSuccess)
++		return status;
++
++	port->peer_cn = NULL;
++	port->peer_cert_valid = false;
++
++	cert = SSL_PeerCertificate(port->pr_fd);
++	if (!cert)
++	{
++		/* Shouldn't be possible; why did we get a client cert callback? */
++		Assert(cert != NULL);
++
++		PR_SetError(SEC_ERROR_LIBRARY_FAILURE, 0);
++		return SECFailure;
++	}
++
++	peer_cn = raw_subject_common_name(cert, &len);
++	if (!peer_cn)
++	{
++		/* No Common Name, but the certificate otherwise checks out. */
++		port->peer_cert_valid = true;
++
++		status = SECSuccess;
++		goto cleanup;
++	}
++
++	/*
++	 * Reject embedded NULLs in certificate common name to prevent attacks like
++	 * CVE-2009-4034.
++	 */
++	if (len != strlen(peer_cn))
++	{
++		ereport(COMMERROR,
++				(errcode(ERRCODE_PROTOCOL_VIOLATION),
++				 errmsg("SSL certificate's common name contains embedded null")));
++
++		pfree(peer_cn);
++		PR_SetError(SEC_ERROR_CERT_NOT_VALID, 0);
++
++		status = SECFailure;
++		goto cleanup;
++	}
++
++	port->peer_cn = peer_cn;
++	port->peer_cert_valid = true;
++
++	port->peer_dn = pg_CERT_GetDistinguishedName(cert);
++	if  (!port->peer_dn)
++	{
++		ereport(COMMERROR,
++				(errcode(ERRCODE_PROTOCOL_VIOLATION),
++				 errmsg("unable to get SSL certificate's distinguished name")));
++
++		pfree(peer_cn);
++		PR_SetError(SEC_ERROR_CERT_NOT_VALID, 0);
++
++		status = SECFailure;
++		goto cleanup;
++	}
++
++	status = SECSuccess;
++
++cleanup:
++	CERT_DestroyCertificate(cert);
++	return status;
++}
++
++static PRStatus
++pg_ssl_close(PRFileDesc *fd)
++{
++	/*
++	 * Disconnect our private Port from the fd before closing out the stack.
++	 * (Debug builds of NSPR will assert if we do not.)
++	 */
++	fd->secret = NULL;
++	return PR_GetDefaultIOMethods()->close(fd);
++}
++
++static PRFileDesc *
++init_iolayer(Port *port)
++{
++	const		PRIOMethods *default_methods;
++	PRFileDesc *layer;
++
++	/*
++	 * Start by initializing our layer with all the default methods so that we
++	 * can selectively override the ones we want while still ensuring that we
++	 * have a complete layer specification.
++	 */
++	default_methods = PR_GetDefaultIOMethods();
++	memcpy(&pr_iomethods, default_methods, sizeof(PRIOMethods));
++
++	pr_iomethods.close = pg_ssl_close;
++
++	/*
++	 * Each IO layer must be identified by a unique name, where uniqueness is
++	 * per connection. Each connection in a postgres cluster can generate the
++	 * identity from the same string as they will create their IO layers on
++	 * different sockets. Only one layer per socket can have the same name.
++	 */
++	pr_id = PR_GetUniqueIdentity("PostgreSQL Server");
++	if (pr_id == PR_INVALID_IO_LAYER)
++	{
++		ereport(ERROR,
++				(errmsg("out of memory when setting up TLS connection")));
++		return NULL;
++	}
++
++	/*
++	 * Create the actual IO layer as a stub such that it can be pushed onto
++	 * the layer stack. The step via a stub is required as we define custom
++	 * callbacks.
++	 */
++	layer = PR_CreateIOLayerStub(pr_id, &pr_iomethods);
++	if (!layer)
++	{
++		ereport(ERROR,
++				(errmsg("unable to create NSS I/O layer")));
++		return NULL;
++	}
++
++	/* Store the Port as private data available in callbacks */
++	layer->secret = (void *) port;
++
++	return layer;
++}
++
++/*
++ * ssl_protocol_version_to_nss
++ *			Translate PostgreSQL TLS version to NSS version
++ *
++ * Returns zero in case the requested TLS version is undefined (PG_ANY) and
++ * should be set by the caller, or -1 on failure.
++ */
++static uint16
++ssl_protocol_version_to_nss(int v)
++{
++	switch (v)
++	{
++			/*
++			 * There is no SSL_LIBRARY_ macro defined in NSS with the value
++			 * zero, so we use this to signal the caller that the highest
++			 * useful version should be set on the connection.
++			 */
++		case PG_TLS_ANY:
++			return 0;
++
++			/*
++			 * No guard is required here as there are no versions of NSS
++			 * without support for TLS1.
++			 */
++		case PG_TLS1_VERSION:
++			return SSL_LIBRARY_VERSION_TLS_1_0;
++		case PG_TLS1_1_VERSION:
++#ifdef SSL_LIBRARY_VERSION_TLS_1_1
++			return SSL_LIBRARY_VERSION_TLS_1_1;
++#else
++			break;
++#endif
++		case PG_TLS1_2_VERSION:
++#ifdef SSL_LIBRARY_VERSION_TLS_1_2
++			return SSL_LIBRARY_VERSION_TLS_1_2;
++#else
++			break;
++#endif
++		case PG_TLS1_3_VERSION:
++#ifdef SSL_LIBRARY_VERSION_TLS_1_3
++			return SSL_LIBRARY_VERSION_TLS_1_3;
++#else
++			break;
++#endif
++		default:
++			break;
++	}
++
++	return -1;
++}
++
++/*
++ * pg_SSLerrmessage
++ *		Create and return a human readable error message given
++ *		the specified error code
++ *
++ * PR_ErrorToName only converts the enum identifier of the error to string,
++ * but that can be quite useful for debugging (and in case PR_ErrorToString is
++ * unable to render a message then we at least have something).
++ */
++static char *
++pg_SSLerrmessage(PRErrorCode errcode)
++{
++	return psprintf("%s (%s)",
++					PR_ErrorToString(errcode, PR_LANGUAGE_I_DEFAULT),
++					PR_ErrorToName(errcode));
++}
++
++/*
++ * pg_SSLAlertSent
++ *		Callback for TLS alerts sent from NSS
++ *
++ * The alert system is intended to provide information on ongoing issues to
++ * the TLS implementation such that they can be logged. It is not replacing
++ * error handling for the NSS API, but rather adds a more finegrained way of
++ * extracting information on errors during connection processing. The actual
++ * error names are however only accessible in a private NSS header and not
++ * exported. Thus, we only use it for close_notify which is defined as zero.
++ *
++ * See https://bugzilla.mozilla.org/show_bug.cgi?id=956866 for further
++ * discussion on this interface.
++ */
++static void
++pg_SSLAlertSent(const PRFileDesc *fd, void *private_data, const SSLAlert *alert)
++{
++	Port *port = (Port *) private_data;
++
++	/*
++	 * close_notify is not an error, but an indication that the connection
++	 * was orderly closed. Since the backend is only closing connections where
++	 * TLS is no longer in use, log an error in case this wasn't the case.
++	 * close_notify is defined in the NSS private enum SSL3AlertDescription
++	 * as zero.
++	 */
++	if (alert->description == 0)
++	{
++		if (port->ssl_in_use)
++			ereport(COMMERROR,
++					 errmsg("closing an active TLS connection"));
++		return;
++	}
++
++	/*
++	 * Any other alert received indicates an error, but since they can't be
++	 * made heads or tails with without reading the NSS source code let's
++	 * just log them as DEBUG information as they are of limited value in
++	 * any other circumstance.
++	 */
++	ereport(DEBUG2,
++			(errmsg_internal("TLS alert received: %d", alert->description)));
++}
++
++/*
++ * pg_SSLShutdownFunc
++ *		Callback for NSS shutdown
++ *
++ * If NSS is terminated from the outside when the connection is still in use
++ * we must treat this as potentially hostile and immediately close to avoid
++ * leaking the connection in any way. Once this is called, NSS will shutdown
++ * regardless so we may as well clean up the best we can. Returning SECFailure
++ * will cause the NSS shutdown to return with an error, but it will shutdown
++ * nevertheless. nss_data is reserved for future use and is always NULL.
++ */
++static SECStatus
++pg_SSLShutdownFunc(void *private_data, void *nss_data)
++{
++	Port *port = (Port *) private_data;
++
++	if (!port || !port->ssl_in_use)
++		return SECSuccess;
++
++	/*
++	 * There is a connection still open, close it and signal to whatever that
++	 * called the shutdown that it was erroneous.
++	 */
++	be_tls_close(port);
++	be_tls_destroy();
++
++	return SECFailure;
++}
+diff --git a/src/backend/libpq/be-secure.c b/src/backend/libpq/be-secure.c
+index 8ef083200a..cf056f5364 100644
+--- a/src/backend/libpq/be-secure.c
++++ b/src/backend/libpq/be-secure.c
+@@ -50,6 +50,7 @@ bool		ssl_passphrase_command_supports_reload;
+ #ifdef USE_SSL
+ bool		ssl_loaded_verify_locations = false;
+ #endif
++char	   *ssl_database;
+ 
+ /* GUC variable controlling SSL cipher list */
+ char	   *SSLCipherSuites = NULL;
+diff --git a/src/backend/utils/misc/guc.c b/src/backend/utils/misc/guc.c
+index c339acf067..eb6cc292ba 100644
+--- a/src/backend/utils/misc/guc.c
++++ b/src/backend/utils/misc/guc.c
+@@ -4410,7 +4410,11 @@ static struct config_string ConfigureNamesString[] =
+ 		},
+ 		&ssl_library,
+ #ifdef USE_SSL
++#if defined(USE_OPENSSL)
+ 		"OpenSSL",
++#elif defined(USE_NSS)
++		"NSS",
++#endif
+ #else
+ 		"",
+ #endif
+@@ -4478,6 +4482,16 @@ static struct config_string ConfigureNamesString[] =
+ 		check_canonical_path, assign_pgstat_temp_directory, NULL
+ 	},
+ 
++	{
++		{"ssl_database", PGC_SIGHUP, CONN_AUTH_SSL,
++			gettext_noop("Location of the NSS certificate database."),
++			NULL
++		},
++		&ssl_database,
++		"",
++		NULL, NULL, NULL
++	},
++
+ 	{
+ 		{"synchronous_standby_names", PGC_SIGHUP, REPLICATION_PRIMARY,
+ 			gettext_noop("Number of synchronous standbys and list of names of potential synchronous ones."),
+@@ -4506,8 +4520,10 @@ static struct config_string ConfigureNamesString[] =
+ 			GUC_SUPERUSER_ONLY
+ 		},
+ 		&SSLCipherSuites,
+-#ifdef USE_OPENSSL
++#if defined(USE_OPENSSL)
+ 		"HIGH:MEDIUM:+3DES:!aNULL",
++#elif defined (USE_NSS)
++		"",
+ #else
+ 		"none",
+ #endif
+diff --git a/src/common/cipher_nss.c b/src/common/cipher_nss.c
+new file mode 100644
+index 0000000000..30b32a7908
+--- /dev/null
++++ b/src/common/cipher_nss.c
+@@ -0,0 +1,192 @@
++/*-------------------------------------------------------------------------
++ *
++ * cipher_nss.c
++ *	  NSS functionality shared between frontend and backend for working
++ *	  with ciphers
++ *
++ * This should only be used if code is compiled with NSS support.
++ *
++ * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
++ * Portions Copyright (c) 1994, Regents of the University of California
++ *
++ * IDENTIFICATION
++ *        src/common/cipher_nss.c
++ *
++ *-------------------------------------------------------------------------
++ */
++
++#ifndef FRONTEND
++#include "postgres.h"
++#else
++#include "postgres_fe.h"
++#endif
++
++#include "common/nss.h"
++
++#define INVALID_CIPHER	0xFFFF
++
++typedef struct
++{
++	SECOidTag	signature;
++	SECOidTag	hash;
++	int			len;
++}			NSSSignatureAlgorithm;
++
++static const NSSSignatureAlgorithm NSS_SCRAMDigestAlgorithm[] = {
++
++	{SEC_OID_PKCS1_MD5_WITH_RSA_ENCRYPTION, SEC_OID_SHA256, SHA256_LENGTH},
++	{SEC_OID_PKCS1_SHA1_WITH_RSA_ENCRYPTION, SEC_OID_SHA256, SHA256_LENGTH},
++	{SEC_OID_ISO_SHA_WITH_RSA_SIGNATURE, SEC_OID_SHA256, SHA256_LENGTH},
++	{SEC_OID_ISO_SHA1_WITH_RSA_SIGNATURE, SEC_OID_SHA256, SHA256_LENGTH},
++	{SEC_OID_PKCS5_PBE_WITH_MD5_AND_DES_CBC, SEC_OID_SHA256, SHA256_LENGTH},
++
++	{SEC_OID_ANSIX962_ECDSA_SHA224_SIGNATURE, SEC_OID_SHA224, SHA224_LENGTH},
++	{SEC_OID_PKCS1_SHA224_WITH_RSA_ENCRYPTION, SEC_OID_SHA224, SHA224_LENGTH},
++	{SEC_OID_NIST_DSA_SIGNATURE_WITH_SHA224_DIGEST, SEC_OID_SHA224, SHA224_LENGTH},
++
++	{SEC_OID_ANSIX962_ECDSA_SHA256_SIGNATURE, SEC_OID_SHA256, SHA256_LENGTH},
++	{SEC_OID_PKCS1_SHA256_WITH_RSA_ENCRYPTION, SEC_OID_SHA256, SHA256_LENGTH},
++	{SEC_OID_NIST_DSA_SIGNATURE_WITH_SHA256_DIGEST, SEC_OID_SHA256, SHA256_LENGTH},
++
++	{SEC_OID_ANSIX962_ECDSA_SHA384_SIGNATURE, SEC_OID_SHA384, SHA384_LENGTH},
++	{SEC_OID_PKCS1_SHA384_WITH_RSA_ENCRYPTION, SEC_OID_SHA384, SHA384_LENGTH},
++
++	{SEC_OID_ANSIX962_ECDSA_SHA512_SIGNATURE, SEC_OID_SHA512, SHA512_LENGTH},
++	{SEC_OID_PKCS1_SHA512_WITH_RSA_ENCRYPTION, SEC_OID_SHA512, SHA512_LENGTH},
++
++	{0, 0}
++};
++
++typedef struct
++{
++	const char *name;
++	PRUint16	number;
++}			NSSCiphers;
++
++/*
++ * This list is a partial copy of the ciphers in NSS files lib/ssl/sslproto.h
++ * in order to provide a human readable version of the ciphers. It would be
++ * nice to not have to have this, but NSS doesn't provide any API addressing
++ * the ciphers by name. TODO: do we want more of the ciphers, or perhaps less?
++ */
++static const NSSCiphers NSS_CipherList[] = {
++
++	{"TLS_NULL_WITH_NULL_NULL", TLS_NULL_WITH_NULL_NULL},
++
++	{"TLS_RSA_WITH_NULL_MD5", TLS_RSA_WITH_NULL_MD5},
++	{"TLS_RSA_WITH_NULL_SHA", TLS_RSA_WITH_NULL_SHA},
++	{"TLS_RSA_WITH_RC4_128_MD5", TLS_RSA_WITH_RC4_128_MD5},
++	{"TLS_RSA_WITH_RC4_128_SHA", TLS_RSA_WITH_RC4_128_SHA},
++	{"TLS_RSA_WITH_IDEA_CBC_SHA", TLS_RSA_WITH_IDEA_CBC_SHA},
++	{"TLS_RSA_WITH_DES_CBC_SHA", TLS_RSA_WITH_DES_CBC_SHA},
++	{"TLS_RSA_WITH_3DES_EDE_CBC_SHA", TLS_RSA_WITH_3DES_EDE_CBC_SHA},
++
++	{"TLS_DH_DSS_WITH_DES_CBC_SHA", TLS_DH_DSS_WITH_DES_CBC_SHA},
++	{"TLS_DH_DSS_WITH_3DES_EDE_CBC_SHA", TLS_DH_DSS_WITH_3DES_EDE_CBC_SHA},
++	{"TLS_DH_RSA_WITH_DES_CBC_SHA", TLS_DH_RSA_WITH_DES_CBC_SHA},
++	{"TLS_DH_RSA_WITH_3DES_EDE_CBC_SHA", TLS_DH_RSA_WITH_3DES_EDE_CBC_SHA},
++
++	{"TLS_DHE_DSS_WITH_DES_CBC_SHA", TLS_DHE_DSS_WITH_DES_CBC_SHA},
++	{"TLS_DHE_DSS_WITH_3DES_EDE_CBC_SHA", TLS_DHE_DSS_WITH_3DES_EDE_CBC_SHA},
++	{"TLS_DHE_RSA_WITH_DES_CBC_SHA", TLS_DHE_RSA_WITH_DES_CBC_SHA},
++	{"TLS_DHE_RSA_WITH_3DES_EDE_CBC_SHA", TLS_DHE_RSA_WITH_3DES_EDE_CBC_SHA},
++
++	{"TLS_DH_anon_WITH_RC4_128_MD5", TLS_DH_anon_WITH_RC4_128_MD5},
++	{"TLS_DH_anon_WITH_DES_CBC_SHA", TLS_DH_anon_WITH_DES_CBC_SHA},
++	{"TLS_DH_anon_WITH_3DES_EDE_CBC_SHA", TLS_DH_anon_WITH_3DES_EDE_CBC_SHA},
++
++	{"TLS_RSA_WITH_AES_128_CBC_SHA", TLS_RSA_WITH_AES_128_CBC_SHA},
++	{"TLS_DH_DSS_WITH_AES_128_CBC_SHA", TLS_DH_DSS_WITH_AES_128_CBC_SHA},
++	{"TLS_DH_RSA_WITH_AES_128_CBC_SHA", TLS_DH_RSA_WITH_AES_128_CBC_SHA},
++	{"TLS_DHE_DSS_WITH_AES_128_CBC_SHA", TLS_DHE_DSS_WITH_AES_128_CBC_SHA},
++	{"TLS_DHE_RSA_WITH_AES_128_CBC_SHA", TLS_DHE_RSA_WITH_AES_128_CBC_SHA},
++	{"TLS_DH_anon_WITH_AES_128_CBC_SHA", TLS_DH_anon_WITH_AES_128_CBC_SHA},
++
++	{"TLS_RSA_WITH_AES_256_CBC_SHA", TLS_RSA_WITH_AES_256_CBC_SHA},
++	{"TLS_DH_DSS_WITH_AES_256_CBC_SHA", TLS_DH_DSS_WITH_AES_256_CBC_SHA},
++	{"TLS_DH_RSA_WITH_AES_256_CBC_SHA", TLS_DH_RSA_WITH_AES_256_CBC_SHA},
++	{"TLS_DHE_DSS_WITH_AES_256_CBC_SHA", TLS_DHE_DSS_WITH_AES_256_CBC_SHA},
++	{"TLS_DHE_RSA_WITH_AES_256_CBC_SHA", TLS_DHE_RSA_WITH_AES_256_CBC_SHA},
++	{"TLS_DH_anon_WITH_AES_256_CBC_SHA", TLS_DH_anon_WITH_AES_256_CBC_SHA},
++	{"TLS_RSA_WITH_NULL_SHA256", TLS_RSA_WITH_NULL_SHA256},
++	{"TLS_RSA_WITH_AES_128_CBC_SHA256", TLS_RSA_WITH_AES_128_CBC_SHA256},
++	{"TLS_RSA_WITH_AES_256_CBC_SHA256", TLS_RSA_WITH_AES_256_CBC_SHA256},
++
++	{"TLS_DHE_DSS_WITH_AES_128_CBC_SHA256", TLS_DHE_DSS_WITH_AES_128_CBC_SHA256},
++	{"TLS_RSA_WITH_CAMELLIA_128_CBC_SHA", TLS_RSA_WITH_CAMELLIA_128_CBC_SHA},
++	{"TLS_DH_DSS_WITH_CAMELLIA_128_CBC_SHA", TLS_DH_DSS_WITH_CAMELLIA_128_CBC_SHA},
++	{"TLS_DH_RSA_WITH_CAMELLIA_128_CBC_SHA", TLS_DH_RSA_WITH_CAMELLIA_128_CBC_SHA},
++	{"TLS_DHE_DSS_WITH_CAMELLIA_128_CBC_SHA", TLS_DHE_DSS_WITH_CAMELLIA_128_CBC_SHA},
++	{"TLS_DHE_RSA_WITH_CAMELLIA_128_CBC_SHA", TLS_DHE_RSA_WITH_CAMELLIA_128_CBC_SHA},
++	{"TLS_DH_anon_WITH_CAMELLIA_128_CBC_SHA", TLS_DH_anon_WITH_CAMELLIA_128_CBC_SHA},
++
++	{"TLS_DHE_DSS_WITH_RC4_128_SHA", TLS_DHE_DSS_WITH_RC4_128_SHA},
++	{"TLS_DHE_RSA_WITH_AES_128_CBC_SHA256", TLS_DHE_RSA_WITH_AES_128_CBC_SHA256},
++	{"TLS_DHE_DSS_WITH_AES_256_CBC_SHA256", TLS_DHE_DSS_WITH_AES_256_CBC_SHA256},
++	{"TLS_DHE_RSA_WITH_AES_256_CBC_SHA256", TLS_DHE_RSA_WITH_AES_256_CBC_SHA256},
++
++	{"TLS_RSA_WITH_CAMELLIA_256_CBC_SHA", TLS_RSA_WITH_CAMELLIA_256_CBC_SHA},
++	{"TLS_DH_DSS_WITH_CAMELLIA_256_CBC_SHA", TLS_DH_DSS_WITH_CAMELLIA_256_CBC_SHA},
++	{"TLS_DH_RSA_WITH_CAMELLIA_256_CBC_SHA", TLS_DH_RSA_WITH_CAMELLIA_256_CBC_SHA},
++	{"TLS_DHE_DSS_WITH_CAMELLIA_256_CBC_SHA", TLS_DHE_DSS_WITH_CAMELLIA_256_CBC_SHA},
++	{"TLS_DHE_RSA_WITH_CAMELLIA_256_CBC_SHA", TLS_DHE_RSA_WITH_CAMELLIA_256_CBC_SHA},
++	{"TLS_DH_anon_WITH_CAMELLIA_256_CBC_SHA", TLS_DH_anon_WITH_CAMELLIA_256_CBC_SHA},
++
++	{"TLS_RSA_WITH_SEED_CBC_SHA", TLS_RSA_WITH_SEED_CBC_SHA},
++
++	{"TLS_RSA_WITH_AES_128_GCM_SHA256", TLS_RSA_WITH_AES_128_GCM_SHA256},
++	{"TLS_RSA_WITH_AES_256_GCM_SHA384", TLS_RSA_WITH_AES_256_GCM_SHA384},
++	{"TLS_DHE_RSA_WITH_AES_128_GCM_SHA256", TLS_DHE_RSA_WITH_AES_128_GCM_SHA256},
++	{"TLS_DHE_RSA_WITH_AES_256_GCM_SHA384", TLS_DHE_RSA_WITH_AES_256_GCM_SHA384},
++	{"TLS_DHE_DSS_WITH_AES_128_GCM_SHA256", TLS_DHE_DSS_WITH_AES_128_GCM_SHA256},
++	{"TLS_DHE_DSS_WITH_AES_256_GCM_SHA384", TLS_DHE_DSS_WITH_AES_256_GCM_SHA384},
++
++	{"TLS_AES_128_GCM_SHA256", TLS_AES_128_GCM_SHA256},
++	{"TLS_AES_256_GCM_SHA384", TLS_AES_256_GCM_SHA384},
++	{"TLS_CHACHA20_POLY1305_SHA256", TLS_CHACHA20_POLY1305_SHA256},
++	{NULL, 0}
++};
++
++/*
++ * pg_find_cipher
++ *			Translate an NSS ciphername to the cipher code
++ *
++ * Searches the configured ciphers for the corresponding cipher code to the
++ * name. Search is performed case insensitive.
++ */
++bool
++pg_find_cipher(char *name, PRUint16 *cipher)
++{
++	const		NSSCiphers *cipher_list;
++
++	for (cipher_list = NSS_CipherList; cipher_list->name; cipher_list++)
++	{
++		if (pg_strcasecmp(cipher_list->name, name) == 0)
++		{
++			*cipher = cipher_list->number;
++			return true;
++		}
++	}
++
++	return false;
++}
++
++bool
++pg_find_signature_algorithm(SECOidTag signature, SECOidTag *algorithm, int *len)
++{
++	const NSSSignatureAlgorithm *candidate;
++
++	candidate = NSS_SCRAMDigestAlgorithm;
++
++	for (candidate = NSS_SCRAMDigestAlgorithm; candidate->signature; candidate++)
++	{
++		if (signature == candidate->signature)
++		{
++			*algorithm = candidate->hash;
++			*len = candidate->len;
++			return true;
++		}
++	}
++
++	return false;
++}
+diff --git a/src/common/protocol_nss.c b/src/common/protocol_nss.c
+new file mode 100644
+index 0000000000..e8225a4d9d
+--- /dev/null
++++ b/src/common/protocol_nss.c
+@@ -0,0 +1,59 @@
++/*-------------------------------------------------------------------------
++ *
++ * protocol_nss.c
++ *	  NSS functionality shared between frontend and backend for working
++ *	  with protocols
++ *
++ * This should only be used if code is compiled with NSS support.
++ *
++ * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
++ * Portions Copyright (c) 1994, Regents of the University of California
++ *
++ * IDENTIFICATION
++ *		  src/common/protocol_nss.c
++ *
++ *-------------------------------------------------------------------------
++ */
++
++#ifndef FRONTEND
++#include "postgres.h"
++#else
++#include "postgres_fe.h"
++#endif
++
++#include "common/nss.h"
++
++/*
++ * ssl_protocol_version_to_string
++ *			Translate NSS TLS version to string
++ */
++char *
++ssl_protocol_version_to_string(int v)
++{
++	switch (v)
++	{
++		/* SSL v2 and v3 are not supported */
++		case SSL_LIBRARY_VERSION_2:
++		case SSL_LIBRARY_VERSION_3_0:
++			Assert(false);
++			break;
++
++		case SSL_LIBRARY_VERSION_TLS_1_0:
++			return pstrdup("TLSv1.0");
++#ifdef SSL_LIBRARY_VERSION_TLS_1_1
++		case SSL_LIBRARY_VERSION_TLS_1_1:
++			return pstrdup("TLSv1.1");
++#endif
++#ifdef SSL_LIBRARY_VERSION_TLS_1_2
++		case SSL_LIBRARY_VERSION_TLS_1_2:
++			return pstrdup("TLSv1.2");
++#endif
++#ifdef SSL_LIBRARY_VERSION_TLS_1_3
++		case SSL_LIBRARY_VERSION_TLS_1_3:
++			return pstrdup("TLSv1.3");
++#endif
++	}
++
++	return pstrdup("unknown");
++}
++
+diff --git a/src/include/common/nss.h b/src/include/common/nss.h
+new file mode 100644
+index 0000000000..3385429f91
+--- /dev/null
++++ b/src/include/common/nss.h
+@@ -0,0 +1,52 @@
++/*-------------------------------------------------------------------------
++ *
++ * nss.h
++ *	  NSS supporting functionality shared between frontend and backend
++ *
++ * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
++ * Portions Copyright (c) 1994, Regents of the University of California
++ *
++ * IDENTIFICATION
++ *		  src/include/common/nss.h
++ *
++ *-------------------------------------------------------------------------
++ */
++#ifndef COMMON_NSS_H
++#define COMMON_NSS_H
++
++#ifdef USE_NSS
++
++/*
++ * BITS_PER_BYTE is also defined in the NSPR header files, so we need to undef
++ * our version to avoid compiler warnings on redefinition.
++ */
++#define pg_BITS_PER_BYTE BITS_PER_BYTE
++#undef BITS_PER_BYTE
++/*
++ * The nspr/obsolete/protypes.h NSPR header typedefs uint64 and int64 with
++ * colliding definitions from ours, causing a much expected compiler error.
++ * Remove backwards compatibility with ancient NSPR versions to avoid this.
++ */
++#define NO_NSPR_10_SUPPORT
++#include <nspr/nspr.h>
++#include <nspr/prerror.h>
++#include <nspr/prio.h>
++#include <nspr/prmem.h>
++#include <nspr/prtypes.h>
++
++
++#include <nss/nss.h>
++#include <nss/hasht.h>
++#include <nss/secoidt.h>
++#include <nss/sslproto.h>
++
++/* src/common/cipher_nss.c */
++bool pg_find_cipher(char *name, PRUint16 *cipher);
++bool pg_find_signature_algorithm(SECOidTag signature, SECOidTag *digest, int *len);
++
++/* src/common/protocol_nss.c */
++char *ssl_protocol_version_to_string(int version);
++
++#endif							/* USE_NSS */
++
++#endif							/* COMMON_NSS_H */
+diff --git a/src/include/libpq/libpq-be.h b/src/include/libpq/libpq-be.h
+index 02015efe13..c8388c5450 100644
+--- a/src/include/libpq/libpq-be.h
++++ b/src/include/libpq/libpq-be.h
+@@ -212,13 +212,18 @@ typedef struct Port
+ 	bool		peer_cert_valid;
+ 
+ 	/*
+-	 * OpenSSL structures. (Keep these last so that the locations of other
+-	 * fields are the same whether or not you build with SSL enabled.)
++	 * TLS backend specific structures. (Keep these last so that the locations
++	 * of other fields are the same whether or not you build with SSL
++	 * enabled.)
+ 	 */
+ #ifdef USE_OPENSSL
+ 	SSL		   *ssl;
+ 	X509	   *peer;
+ #endif
++
++#ifdef USE_NSS
++	void	   *pr_fd;
++#endif
+ } Port;
+ 
+ #ifdef USE_SSL
+@@ -301,7 +306,7 @@ extern void be_tls_get_peer_serial(Port *port, char *ptr, size_t len);
+  * This is not supported with old versions of OpenSSL that don't have
+  * the X509_get_signature_nid() function.
+  */
+-#if defined(USE_OPENSSL) && defined(HAVE_X509_GET_SIGNATURE_NID)
++#if defined(USE_NSS) || (defined(USE_OPENSSL) && defined(HAVE_X509_GET_SIGNATURE_NID))
+ #define HAVE_BE_TLS_GET_CERTIFICATE_HASH
+ extern char *be_tls_get_certificate_hash(Port *port, size_t *len);
+ #endif
+@@ -311,6 +316,10 @@ extern char *be_tls_get_certificate_hash(Port *port, size_t *len);
+ typedef void (*openssl_tls_init_hook_typ) (SSL_CTX *context, bool isServerStart);
+ extern PGDLLIMPORT openssl_tls_init_hook_typ openssl_tls_init_hook;
+ #endif
++#ifdef USE_NSS
++typedef void (*nss_tls_init_hook_type) (bool isServerStart);
++extern PGDLLIMPORT nss_tls_init_hook_type nss_tls_init_hook;
++#endif
+ 
+ #endif							/* USE_SSL */
+ 
+diff --git a/src/include/libpq/libpq.h b/src/include/libpq/libpq.h
+index 6c51b2f20f..0d5b15d823 100644
+--- a/src/include/libpq/libpq.h
++++ b/src/include/libpq/libpq.h
+@@ -97,6 +97,7 @@ extern PGDLLIMPORT bool ssl_passphrase_command_supports_reload;
+ #ifdef USE_SSL
+ extern bool ssl_loaded_verify_locations;
+ #endif
++extern char *ssl_database;
+ 
+ extern int	secure_initialize(bool isServerStart);
+ extern bool secure_loaded_verify_locations(void);
+diff --git a/src/include/pg_config_manual.h b/src/include/pg_config_manual.h
+index 614035e215..6af89d9e98 100644
+--- a/src/include/pg_config_manual.h
++++ b/src/include/pg_config_manual.h
+@@ -185,7 +185,7 @@
+  * USE_SSL code should be compiled only when compiling with an SSL
+  * implementation.
+  */
+-#ifdef USE_OPENSSL
++#if defined(USE_OPENSSL) || defined(USE_NSS)
+ #define USE_SSL
+ #endif
+ 
+diff --git a/src/interfaces/libpq/fe-connect.c b/src/interfaces/libpq/fe-connect.c
+index 49eec3e835..13a231e505 100644
+--- a/src/interfaces/libpq/fe-connect.c
++++ b/src/interfaces/libpq/fe-connect.c
+@@ -344,6 +344,10 @@ static const internalPQconninfoOption PQconninfoOptions[] = {
+ 		"Target-Session-Attrs", "", 15, /* sizeof("prefer-standby") = 15 */
+ 	offsetof(struct pg_conn, target_session_attrs)},
+ 
++	{"ssldatabase", NULL, NULL, NULL,
++		"CertificateDatabase", "", 64,
++	offsetof(struct pg_conn, ssldatabase)},
++
+ 	/* Terminating entry --- MUST BE LAST */
+ 	{NULL, NULL, NULL, NULL,
+ 	NULL, NULL, 0}
+diff --git a/src/interfaces/libpq/fe-secure-nss.c b/src/interfaces/libpq/fe-secure-nss.c
+new file mode 100644
+index 0000000000..0b297d3aed
+--- /dev/null
++++ b/src/interfaces/libpq/fe-secure-nss.c
+@@ -0,0 +1,1197 @@
++/*-------------------------------------------------------------------------
++ *
++ * fe-secure-nss.c
++ *	  functions for supporting NSS as a TLS backend for frontend libpq
++ *
++ * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
++ * Portions Copyright (c) 1994, Regents of the University of California
++ *
++ * IDENTIFICATION
++ *	  src/interfaces/libpq/fe-secure-nss.c
++ *
++ *-------------------------------------------------------------------------
++ */
++
++#include "postgres_fe.h"
++
++#include "libpq-fe.h"
++#include "fe-auth.h"
++#include "fe-secure-common.h"
++#include "libpq-int.h"
++#include "common/cryptohash.h"
++#include "common/nss.h"
++
++#ifdef ENABLE_THREAD_SAFETY
++#ifdef WIN32
++#include "pthread-win32.h"
++#else
++#include <pthread.h>
++#endif
++#endif
++
++/*
++ * The nspr/obsolete/protypes.h NSPR header typedefs uint64 and int64 with
++ * colliding definitions from ours, causing a much expected compiler error.
++ * Remove backwards compatibility with ancient NSPR versions to avoid this.
++ */
++#define NO_NSPR_10_SUPPORT
++#include <nspr/nspr.h>
++#include <nspr/prerror.h>
++#include <nspr/prinit.h>
++#include <nspr/prio.h>
++
++#include <nss/hasht.h>
++#include <nss/nss.h>
++#include <nss/ssl.h>
++#include <nss/sslproto.h>
++#include <nss/pk11func.h>
++#include <nss/secerr.h>
++#include <nss/secoidt.h>
++#include <nss/secmod.h>
++
++static SECStatus pg_load_nss_module(SECMODModule **module, const char *library, const char *name);
++static SECStatus pg_bad_cert_handler(void *arg, PRFileDesc *fd);
++static const char *pg_SSLerrmessage(PRErrorCode errcode);
++static SECStatus pg_client_auth_handler(void *arg, PRFileDesc *socket, CERTDistNames *caNames,
++										CERTCertificate **pRetCert, SECKEYPrivateKey **pRetKey);
++static SECStatus pg_cert_auth_handler(void *arg, PRFileDesc *fd, PRBool checksig, PRBool isServer);
++static int	ssl_protocol_param_to_nss(const char *protocol);
++static bool certificate_database_has_CA(PGconn *conn);
++
++static char *PQssl_passwd_cb(PK11SlotInfo *slot, PRBool retry, void *arg);
++
++/*
++ * PR_ImportTCPSocket() is a private API, but very widely used, as it's the
++ * only way to make NSS use an already set up POSIX file descriptor rather
++ * than opening one itself. To quote the NSS documentation:
++ *
++ *		"In theory, code that uses PR_ImportTCPSocket may break when NSPR's
++ *		implementation changes. In practice, this is unlikely to happen because
++ *		NSPR's implementation has been stable for years and because of NSPR's
++ *		strong commitment to backward compatibility."
++ *
++ * https://developer.mozilla.org/en-US/docs/Mozilla/Projects/NSPR/Reference/PR_ImportTCPSocket
++ *
++ * The function is declared in <private/pprio.h>, but as it is a header marked
++ * private we declare it here rather than including it.
++ */
++NSPR_API(PRFileDesc *) PR_ImportTCPSocket(int);
++
++static SECMODModule *ca_trust = NULL;
++
++/*
++ * This logic exists in NSS as well, but it's only available for when there is
++ * a database to open, and not only using the system trust store. Thus, we
++ * need to keep our own copy.
++ */
++#if defined(WIN32)
++static const char *ca_trust_name = "nssckbi.dll";
++#elif defined(__darwin__)
++static const char *ca_trust_name = "libnssckbi.dylib";
++#else
++static const char *ca_trust_name = "libnssckbi.so";
++#endif
++
++static PQsslKeyPassHook_nss_type PQsslKeyPassHook = NULL;
++
++#ifdef ENABLE_THREAD_SAFETY
++#ifndef WIN32
++static pthread_mutex_t ssl_config_mutex = PTHREAD_MUTEX_INITIALIZER;
++#else
++static pthread_mutex_t ssl_config_mutex = NULL;
++static long win32_ssl_create_mutex = 0;
++#endif
++#endif							/* ENABLE_THREAD_SAFETY */
++
++/* ------------------------------------------------------------ */
++/*			 Procedures common to all secure sessions			*/
++/* ------------------------------------------------------------ */
++
++/*
++ * pgtls_init_library
++ *
++ * There is no direct equivalent for PQinitOpenSSL in NSS/NSPR, with PR_Init
++ * being the closest match there is. PR_Init is however already documented to
++ * not be required so simply making this a noop seems like the best option.
++ */
++void
++pgtls_init_library(bool do_ssl, int do_crypto)
++{
++	/* noop */
++}
++
++int
++pgtls_init(PGconn *conn, bool do_ssl, bool do_crypto)
++{
++	if (do_ssl)
++	{
++		conn->nss_context = NULL;
++
++		conn->ssl_in_use = false;
++		conn->has_password = false;
++	}
++
++	return 0;
++}
++
++void
++pgtls_close(PGconn *conn)
++{
++	/*
++	 * All NSS references must be cleaned up before we close out the
++	 * context.
++	 */
++	if (conn->pr_fd)
++	{
++		PRStatus	status;
++
++		status = PR_Close(conn->pr_fd);
++		if (status != PR_SUCCESS)
++		{
++			pqInternalNotice(&conn->noticeHooks,
++							 "unable to close NSPR fd: %s",
++							 pg_SSLerrmessage(PR_GetError()));
++		}
++
++		conn->pr_fd = NULL;
++	}
++
++	if (conn->nss_context)
++	{
++		SECStatus	status;
++
++		/* The session cache must be cleared, or we'll leak references */
++		SSL_ClearSessionCache();
++
++		status = NSS_ShutdownContext(conn->nss_context);
++
++		if (status != SECSuccess)
++		{
++			pqInternalNotice(&conn->noticeHooks,
++							 "unable to shut down NSS context: %s",
++							 pg_SSLerrmessage(PR_GetError()));
++		}
++
++		conn->nss_context = NULL;
++	}
++}
++
++PostgresPollingStatusType
++pgtls_open_client(PGconn *conn)
++{
++	SECStatus	status;
++	PRFileDesc *model;
++	NSSInitParameters params;
++	SSLVersionRange desired_range;
++	const char *host;
++
++#ifdef ENABLE_THREAD_SAFETY
++#ifdef WIN32
++	/* This locking is modelled after fe-secure-openssl.c */
++	if (ssl_config_mutex == NULL)
++	{
++		while (InterlockedExchange(&win32_ssl_create_mutex, 1) == 1)
++			/* loop while another thread owns the lock */ ;
++		if (ssl_config_mutex == NULL)
++		{
++			if (pthread_mutex_init(&ssl_config_mutex, NULL))
++			{
++				printfPQExpBuffer(&conn->errorMessage,
++								  libpq_gettext("unable to lock thread"));
++				return PGRES_POLLING_FAILED;
++			}
++		}
++		InterlockedExchange(&win32_ssl_create_mutex, 0);
++	}
++#endif
++	if (pthread_mutex_lock(&ssl_config_mutex))
++	{
++		printfPQExpBuffer(&conn->errorMessage,
++						  libpq_gettext("unable to lock thread"));
++		return PGRES_POLLING_FAILED;
++	}
++#endif							/* ENABLE_THREAD_SAFETY */
++
++	/*
++	 * The NSPR documentation states that runtime initialization via PR_Init
++	 * is no longer required, as the first caller into NSPR will perform the
++	 * initialization implicitly. See be-secure-nss.c for further discussion
++	 * on PR_Init.
++	 */
++	PR_Init(PR_USER_THREAD, PR_PRIORITY_NORMAL, 0);
++
++	/*
++	 * NSS initialization and the use of contexts is further discussed in
++	 * be-secure-nss.c
++	 */
++	memset(&params, 0, sizeof(params));
++	params.length = sizeof(params);
++	params.dbTokenDescription = strdup("postgres");
++
++	if (conn->ssldatabase && strlen(conn->ssldatabase) > 0)
++	{
++		char	   *ssldatabase_path = psprintf("sql:%s", conn->ssldatabase);
++
++		conn->nss_context = NSS_InitContext(ssldatabase_path, "", "", "",
++											&params,
++											NSS_INIT_READONLY | NSS_INIT_PK11RELOAD);
++		pfree(ssldatabase_path);
++
++		if (!conn->nss_context)
++		{
++			printfPQExpBuffer(&conn->errorMessage,
++							  libpq_gettext("unable to open certificate database \"%s\": %s"),
++							  conn->ssldatabase,
++							  pg_SSLerrmessage(PR_GetError()));
++			return PGRES_POLLING_FAILED;
++		}
++	}
++	else
++	{
++		conn->nss_context = NSS_InitContext("", "", "", "", &params,
++											NSS_INIT_READONLY | NSS_INIT_NOCERTDB |
++											NSS_INIT_NOMODDB | NSS_INIT_FORCEOPEN |
++											NSS_INIT_NOROOTINIT | NSS_INIT_PK11RELOAD);
++		if (!conn->nss_context)
++		{
++			printfPQExpBuffer(&conn->errorMessage,
++							  libpq_gettext("unable to initialize NSS: %s"),
++							  pg_SSLerrmessage(PR_GetError()));
++			return PGRES_POLLING_FAILED;
++		}
++	}
++
++	/*
++	 * Configure cipher policy by setting the domestic suite.
++	 *
++	 * Historically there were different cipher policies based on export (and
++	 * import) restrictions: Domestic, Export and France. These are since long
++	 * removed with all ciphers being enabled by default. Due to backwards
++	 * compatibility, the old API is still used even though all three policies
++	 * now do the same thing.
++	 */
++	status = NSS_SetDomesticPolicy();
++	if (status != SECSuccess)
++	{
++		printfPQExpBuffer(&conn->errorMessage,
++						  libpq_gettext("unable to configure cipher policy: %s"),
++						  pg_SSLerrmessage(PR_GetError()));
++
++		return PGRES_POLLING_FAILED;
++	}
++
++	/*
++	 * If we don't have a certificate database, the system trust store is the
++	 * fallback we can use. If we fail to initialize that as well, we can
++	 * still attempt a connection as long as the sslmode isn't verify-*.
++	 */
++	if (!conn->ssldatabase &&
++		(strcmp(conn->sslmode, "verify-ca") == 0 ||
++		 strcmp(conn->sslmode, "verify-full") == 0))
++	{
++		status = pg_load_nss_module(&ca_trust, ca_trust_name, "\"Root Certificates\"");
++		if (status != SECSuccess)
++		{
++			printfPQExpBuffer(&conn->errorMessage,
++							  libpq_gettext("WARNING: unable to load system NSS trust module \"%s\", create a local NSS database and retry : %s"),
++							  ca_trust_name,
++							  pg_SSLerrmessage(PR_GetError()));
++
++			return PGRES_POLLING_FAILED;
++		}
++	}
++
++#ifdef ENABLE_THREAD_SAFETY
++	pthread_mutex_unlock(&ssl_config_mutex);
++#endif
++
++	PK11_SetPasswordFunc(PQssl_passwd_cb);
++
++	/*
++	 * Import the already opened socket as we don't want to use NSPR functions
++	 * for opening the network socket due to how the PostgreSQL protocol works
++	 * with TLS connections. This function is not part of the NSPR public API,
++	 * see the comment at the top of the file for the rationale of still using
++	 * it.
++	 */
++	conn->pr_fd = PR_ImportTCPSocket(conn->sock);
++	if (!conn->pr_fd)
++	{
++		printfPQExpBuffer(&conn->errorMessage,
++						  libpq_gettext("unable to attach to socket: %s"),
++						  pg_SSLerrmessage(PR_GetError()));
++		return PGRES_POLLING_FAILED;
++	}
++
++	/*
++	 * Most of the documentation available, and implementations of, NSS/NSPR
++	 * use the PR_NewTCPSocket() function here, which has the drawback that it
++	 * can only create IPv4 sockets. Instead use PR_OpenTCPSocket() which
++	 * copes with IPv6 as well.
++	 */
++	model = SSL_ImportFD(NULL, PR_OpenTCPSocket(conn->laddr.addr.ss_family));
++	if (!model)
++	{
++		printfPQExpBuffer(&conn->errorMessage,
++						  libpq_gettext("unable to enable TLS: %s"),
++						  pg_SSLerrmessage(PR_GetError()));
++		return PGRES_POLLING_FAILED;
++	}
++
++	/* Disable old protocol versions (SSLv2 and SSLv3) */
++	SSL_OptionSet(model, SSL_ENABLE_SSL2, PR_FALSE);
++	SSL_OptionSet(model, SSL_V2_COMPATIBLE_HELLO, PR_FALSE);
++	SSL_OptionSet(model, SSL_ENABLE_SSL3, PR_FALSE);
++
++#ifdef SSL_CBC_RANDOM_IV
++
++	/*
++	 * Enable protection against the BEAST attack in case the NSS library has
++	 * support for that. While SSLv3 is disabled, we may still allow TLSv1
++	 * which is affected. The option isn't documented as an SSL option, but as
++	 * an NSS environment variable.
++	 */
++	SSL_OptionSet(model, SSL_CBC_RANDOM_IV, PR_TRUE);
++#endif
++
++	/* Set us up as a TLS client for the handshake */
++	SSL_OptionSet(model, SSL_HANDSHAKE_AS_CLIENT, PR_TRUE);
++
++	/*
++	 * When setting the available protocols, we either use the user defined
++	 * configuration values, and if missing we accept whatever is the highest
++	 * version supported by the library as the max and only limit the range in
++	 * the other end at TLSv1.0. ssl_variant_stream is a ProtocolVariant enum
++	 * for Stream protocols, rather than datagram.
++	 */
++	SSL_VersionRangeGetSupported(ssl_variant_stream, &desired_range);
++	desired_range.min = SSL_LIBRARY_VERSION_TLS_1_0;
++
++	if (conn->ssl_min_protocol_version && strlen(conn->ssl_min_protocol_version) > 0)
++	{
++		int			ssl_min_ver = ssl_protocol_param_to_nss(conn->ssl_min_protocol_version);
++
++		if (ssl_min_ver == -1)
++		{
++			printfPQExpBuffer(&conn->errorMessage,
++							  libpq_gettext("invalid value \"%s\" for minimum version of SSL protocol\n"),
++							  conn->ssl_min_protocol_version);
++			return -1;
++		}
++
++		desired_range.min = ssl_min_ver;
++	}
++
++	if (conn->ssl_max_protocol_version && strlen(conn->ssl_max_protocol_version) > 0)
++	{
++		int			ssl_max_ver = ssl_protocol_param_to_nss(conn->ssl_max_protocol_version);
++
++		if (ssl_max_ver == -1)
++		{
++			printfPQExpBuffer(&conn->errorMessage,
++							  libpq_gettext("invalid value \"%s\" for maximum version of SSL protocol\n"),
++							  conn->ssl_max_protocol_version);
++			return -1;
++		}
++
++		desired_range.max = ssl_max_ver;
++	}
++
++	if (SSL_VersionRangeSet(model, &desired_range) != SECSuccess)
++	{
++		printfPQExpBuffer(&conn->errorMessage,
++						  libpq_gettext("unable to set allowed SSL protocol version range: %s"),
++						  pg_SSLerrmessage(PR_GetError()));
++		return PGRES_POLLING_FAILED;
++	}
++
++	/*
++	 * Set up callback for verifying server certificates, as well as for how
++	 * to handle failed verifications.
++	 */
++	SSL_AuthCertificateHook(model, pg_cert_auth_handler, (void *) conn);
++	SSL_BadCertHook(model, pg_bad_cert_handler, (void *) conn);
++
++	/*
++	 * Convert the NSPR socket to an SSL socket. Ensuring the success of this
++	 * operation is critical as NSS SSL_* functions may return SECSuccess on
++	 * the socket even though SSL hasn't been enabled, which introduce a risk
++	 * of silent downgrades.
++	 */
++	conn->pr_fd = SSL_ImportFD(model, conn->pr_fd);
++	if (!conn->pr_fd)
++	{
++		printfPQExpBuffer(&conn->errorMessage,
++						  libpq_gettext("unable to configure client for TLS: %s"),
++						  pg_SSLerrmessage(PR_GetError()));
++		return PGRES_POLLING_FAILED;
++	}
++
++	/*
++	 * The model can now be closed as we've applied the settings of the model
++	 * onto the real socket. From here on we should only use conn->pr_fd.
++	 */
++	PR_Close(model);
++
++	/* Set the private data to be passed to the password callback */
++	SSL_SetPKCS11PinArg(conn->pr_fd, (void *) conn);
++
++	status = SSL_ResetHandshake(conn->pr_fd, PR_FALSE);
++	if (status != SECSuccess)
++	{
++		printfPQExpBuffer(&conn->errorMessage,
++						  libpq_gettext("unable to initiate handshake: %s"),
++						  pg_SSLerrmessage(PR_GetError()));
++		return PGRES_POLLING_FAILED;
++	}
++
++	/* Set callback for client authentication when requested by the server */
++	SSL_GetClientAuthDataHook(conn->pr_fd, pg_client_auth_handler, (void *) conn);
++
++	/*
++	 * Specify which hostname we are expecting to talk to for the ClientHello
++	 * SNI extension. TODO: if the hostname is a literal IP address we skip
++	 * setting it, and check for SNI status in the cert callback. Is this the
++	 * correct course of action?
++	 */
++	host = conn->connhost[conn->whichhost].host;
++	if (host && host[0] &&
++		!(strspn(host, "0123456789.") == strlen(host) ||
++		  strchr(host, ':')))
++		SSL_SetURL(conn->pr_fd, host);
++
++	status = SSL_ForceHandshake(conn->pr_fd);
++
++	if (status != SECSuccess)
++	{
++		printfPQExpBuffer(&conn->errorMessage,
++						  libpq_gettext("SSL error: %s"),
++						  pg_SSLerrmessage(PR_GetError()));
++		return PGRES_POLLING_FAILED;
++	}
++
++	conn->ssl_in_use = true;
++	return PGRES_POLLING_OK;
++}
++
++ssize_t
++pgtls_read(PGconn *conn, void *ptr, size_t len)
++{
++	PRInt32		nread;
++	PRErrorCode status;
++	int			read_errno = 0;
++
++	/*
++	 * PR_Recv blocks until there is data to read or the timeout expires. We
++	 * don't want to sit blocked here, so the timeout is turned off by using
++	 * PR_INTERVAL_NO_WAIT which means "return immediately",  Zero is returned
++	 * for closed connections, while -1 indicates an error within the ongoing
++	 * connection.
++	 */
++	nread = PR_Recv(conn->pr_fd, ptr, len, 0, PR_INTERVAL_NO_WAIT);
++
++	if (nread == 0)
++	{
++		appendPQExpBufferStr(&conn->errorMessage,
++							 libpq_gettext("TLS read error: EOF detected\n"));
++		read_errno = ECONNRESET;
++		nread = -1;
++	}
++	else if (nread == -1)
++	{
++		status = PR_GetError();
++
++		switch (status)
++		{
++			case PR_IO_TIMEOUT_ERROR:
++				/* No data available yet. */
++				nread = 0;
++				break;
++
++			case PR_WOULD_BLOCK_ERROR:
++				read_errno = EWOULDBLOCK;
++				break;
++
++				/*
++				 * The error cases for PR_Recv are not documented, but can be
++				 * reverse engineered from _MD_unix_map_default_error() in the
++				 * NSPR code, defined in pr/src/md/unix/unix_errors.c.
++				 */
++			case PR_NETWORK_UNREACHABLE_ERROR:
++			case PR_CONNECT_RESET_ERROR:
++				read_errno = ECONNRESET;
++				break;
++
++			default:
++				break;
++		}
++
++		if (nread == -1)
++		{
++			printfPQExpBuffer(&conn->errorMessage,
++							  libpq_gettext("TLS read error: %s"),
++							  pg_SSLerrmessage(status));
++		}
++	}
++
++	SOCK_ERRNO_SET(read_errno);
++	return (ssize_t) nread;
++}
++
++/*
++ * pgtls_read_pending
++ *		Check for the existence of data to be read
++ *
++ * SSL_DataPending will check for decrypted data in the receiving buffer, but
++ * does not reveal anything about still encrypted data which will be made
++ * available. Thus, if pgtls_read_pending returns zero it does not guarantee
++ * that a subsequent call to pgtls_read_read would block. This is modelled
++ * around how the OpenSSL implementation treats pending data. The equivalent
++ * to the OpenSSL SSL_has_pending function would be to call PR_Recv with no
++ * wait and PR_MSG_PEEK like so:
++ *
++ *     PR_Recv(conn->pr_fd, &c, 1, PR_MSG_PEEK, PR_INTERVAL_NO_WAIT);
++ */
++bool
++pgtls_read_pending(PGconn *conn)
++{
++	return SSL_DataPending(conn->pr_fd) > 0;
++}
++
++/*
++ * pgtls_write
++ *		Write data on the secure socket
++ *
++ */
++ssize_t
++pgtls_write(PGconn *conn, const void *ptr, size_t len)
++{
++	PRInt32		n;
++	PRErrorCode status;
++	int			write_errno = 0;
++
++	n = PR_Write(conn->pr_fd, ptr, len);
++
++	if (n < 0)
++	{
++		status = PR_GetError();
++
++		switch (status)
++		{
++			case PR_WOULD_BLOCK_ERROR:
++#ifdef EAGAIN
++				write_errno = EAGAIN;
++#else
++				write_errno = EINTR;
++#endif
++				break;
++
++			default:
++				printfPQExpBuffer(&conn->errorMessage,
++								  libpq_gettext("TLS write error: %s"),
++								  pg_SSLerrmessage(status));
++				write_errno = ECONNRESET;
++				break;
++		}
++	}
++
++	SOCK_ERRNO_SET(write_errno);
++	return (ssize_t) n;
++}
++
++char *
++pgtls_get_peer_certificate_hash(PGconn *conn, size_t *len)
++{
++	CERTCertificate *server_cert;
++	SECOidTag	signature_tag;
++	SECOidTag	digest_alg;
++	int			digest_len;
++	PLArenaPool *arena = NULL;
++	SECItem		digest;
++	char	   *ret = NULL;
++	SECStatus	status;
++
++	*len = 0;
++
++	server_cert = SSL_PeerCertificate(conn->pr_fd);
++	if (!server_cert)
++		goto cleanup;
++
++	signature_tag = SECOID_GetAlgorithmTag(&server_cert->signature);
++	if (!pg_find_signature_algorithm(signature_tag, &digest_alg, &digest_len))
++	{
++		printfPQExpBuffer(&conn->errorMessage,
++						  libpq_gettext("could not find digest for OID '%s'\n"),
++						  SECOID_FindOIDTagDescription(signature_tag));
++		goto cleanup;
++	}
++
++	arena = PORT_NewArena(SEC_ASN1_DEFAULT_ARENA_SIZE);
++	digest.data = PORT_ArenaZAlloc(arena, sizeof(unsigned char) * digest_len);
++	if (!digest.data)
++	{
++		printfPQExpBuffer(&conn->errorMessage,
++						  libpq_gettext("out of memory"));
++		goto cleanup;
++	}
++	digest.len = digest_len;
++
++	status = PK11_HashBuf(digest_alg, digest.data, server_cert->derCert.data,
++						  server_cert->derCert.len);
++
++	if (status != SECSuccess)
++	{
++		printfPQExpBuffer(&conn->errorMessage,
++						  libpq_gettext("unable to generate peer certificate digest: %s"),
++						  pg_SSLerrmessage(PR_GetError()));
++		goto cleanup;
++	}
++
++	ret = pg_malloc(digest.len);
++	memcpy(ret, digest.data, digest.len);
++	*len = digest_len;
++
++cleanup:
++	if (arena)
++		PORT_FreeArena(arena, PR_TRUE);
++	if (server_cert)
++		CERT_DestroyCertificate(server_cert);
++
++	return ret;
++}
++
++/*
++ *	Verify that the server certificate matches the hostname we connected to.
++ *
++ * The certificate's Common Name and Subject Alternative Names are considered.
++ */
++int
++pgtls_verify_peer_name_matches_certificate_guts(PGconn *conn,
++												int *names_examined,
++												char **first_name)
++{
++	char	   *server_hostname = NULL;
++	CERTCertificate *server_cert = NULL;
++	SECStatus	status = SECSuccess;
++	SECItem		altname_item;
++	PLArenaPool *arena = NULL;
++	CERTGeneralName *san_list;
++	CERTGeneralName *cn;
++
++	server_hostname = SSL_RevealURL(conn->pr_fd);
++	if (!server_hostname || server_hostname[0] == '\0')
++	{
++		/* If SNI is enabled we must have a hostname set */
++		if (conn->sslsni && conn->sslsni[0])
++			status = SECFailure;
++		goto done;
++	}
++
++	/*
++	 * CERT_VerifyCertName will internally perform RFC 2818 SubjectAltName
++	 * verification.
++	 */
++	server_cert = SSL_PeerCertificate(conn->pr_fd);
++	status = CERT_VerifyCertName(server_cert, server_hostname);
++	if (status != SECSuccess)
++	{
++		printfPQExpBuffer(&conn->errorMessage,
++						  libpq_gettext("unable to verify server hostname: %s"),
++						  pg_SSLerrmessage(PR_GetError()));
++		goto done;
++	}
++
++	status = CERT_FindCertExtension(server_cert, SEC_OID_X509_SUBJECT_ALT_NAME,
++									&altname_item);
++	if (status == SECSuccess)
++	{
++		arena = PORT_NewArena(DER_DEFAULT_CHUNKSIZE);
++		if (!arena)
++		{
++			status = SECFailure;
++			goto done;
++		}
++		san_list = CERT_DecodeAltNameExtension(arena, &altname_item);
++		if (!san_list)
++		{
++			status = SECFailure;
++			goto done;
++		}
++
++		for (cn = san_list; cn != san_list; cn = CERT_GetNextGeneralName(cn))
++		{
++			char	   *alt_name;
++			int			rv;
++			char		tmp[512];
++
++			status = CERT_RFC1485_EscapeAndQuote(tmp, sizeof(tmp),
++												 (char *) cn->name.other.data,
++												 cn->name.other.len);
++
++			if (status != SECSuccess)
++				goto done;
++
++			rv = pq_verify_peer_name_matches_certificate_name(conn, tmp,
++															  strlen(tmp),
++															  &alt_name);
++			if (alt_name)
++			{
++				if (!*first_name)
++					*first_name = alt_name;
++				else
++					free(alt_name);
++			}
++
++			if (rv == 1)
++				status = SECSuccess;
++			else
++			{
++				status = SECFailure;
++				break;
++			}
++		}
++	}
++	else if (PORT_GetError() == SEC_ERROR_EXTENSION_NOT_FOUND)
++		status = SECSuccess;
++	else
++		status = SECSuccess;
++
++done:
++	/* san_list will be freed by freeing the arena it was allocated in */
++	if (arena)
++		PORT_FreeArena(arena, PR_TRUE);
++	if (server_cert)
++		CERT_DestroyCertificate(server_cert);
++	PR_Free(server_hostname);
++
++	if (status == SECSuccess)
++		return 1;
++
++	return 0;
++}
++
++/* ------------------------------------------------------------ */
++/*			PostgreSQL specific TLS support functions			*/
++/* ------------------------------------------------------------ */
++
++static const char *
++pg_SSLerrmessage(PRErrorCode errcode)
++{
++	const char *error;
++
++	/*
++	 * Try to get the user friendly error description, and if that fails try
++	 * to fall back on the name of the PRErrorCode.
++	 */
++	error = PR_ErrorToString(errcode, PR_LANGUAGE_I_DEFAULT);
++	if (!error)
++		error = PR_ErrorToName(errcode);
++	if (error)
++		return error;
++
++	return "unknown TLS error";
++}
++
++static SECStatus
++pg_load_nss_module(SECMODModule **module, const char *library, const char *name)
++{
++	SECMODModule *mod;
++	char	   *modulespec;
++
++	modulespec = psprintf("library=\"%s\", name=\"%s\"", library, name);
++
++	/*
++	 * Attempt to load the specified module. The second parameter is "parent"
++	 * which should always be NULL for application code. The third parameter
++	 * defines if loading should recurse which is only applicable when loading
++	 * a module from within another module. This hierarchy would have to be
++	 * defined in the modulespec, and since we don't support anything but
++	 * directly addressed modules we should pass PR_FALSE.
++	 */
++	mod = SECMOD_LoadUserModule(modulespec, NULL, PR_FALSE);
++	pfree(modulespec);
++
++	if (mod && mod->loaded)
++	{
++		*module = mod;
++		return SECSuccess;
++	}
++
++	SECMOD_DestroyModule(mod);
++	return SECFailure;
++}
++
++/* ------------------------------------------------------------ */
++/*						NSS Callbacks							*/
++/* ------------------------------------------------------------ */
++
++/*
++ * pg_cert_auth_handler
++ *			Callback for authenticating server certificate
++ *
++ * This is pretty much the same procedure as the SSL_AuthCertificate function
++ * provided by NSS, with the difference being server hostname validation. With
++ * SSL_AuthCertificate there is no way to do verify-ca, it only does the -full
++ * flavor of our sslmodes, so we need our own implementation.
++ */
++static SECStatus
++pg_cert_auth_handler(void *arg, PRFileDesc *fd, PRBool checksig, PRBool isServer)
++{
++	SECStatus	status;
++	PGconn	   *conn = (PGconn *) arg;
++	CERTCertificate *server_cert;
++	void	   *pin;
++
++	Assert(!isServer);
++
++	pin = SSL_RevealPinArg(conn->pr_fd);
++	server_cert = SSL_PeerCertificate(conn->pr_fd);
++
++	/*
++	 * VerifyCertificateNow verifies the validity using PR_now from NSPR as a
++	 * timestamp and will perform CRL and OSCP revocation checks. conn->sslcrl
++	 * does not impact NSS connections as any CRL in the NSS database will be
++	 * used automatically.
++	 */
++	status = CERT_VerifyCertificateNow((CERTCertDBHandle *) CERT_GetDefaultCertDB(),
++									   server_cert,
++									   checksig,
++									   certificateUsageSSLServer,
++									   pin,
++									   NULL);
++
++	/*
++	 * If we've already failed validation then there is no point in also
++	 * performing the hostname check for verify-full.
++	 */
++	if (status == SECSuccess)
++	{
++		if (!pq_verify_peer_name_matches_certificate(conn))
++			status = SECFailure;
++	}
++
++	CERT_DestroyCertificate(server_cert);
++	return status;
++}
++
++/*
++ * pg_client_auth_handler
++ *		Callback for client certificate validation
++ *
++ * The client auth callback is not on by default in NSS, so we need to invoke
++ * it ourselves to ensure we can do cert authentication.
++ */
++static SECStatus
++pg_client_auth_handler(void *arg, PRFileDesc *socket, CERTDistNames *caNames,
++					   CERTCertificate **pRetCert, SECKEYPrivateKey **pRetKey)
++{
++	PGconn	   *conn = (PGconn *) arg;
++	char	   *nnptr = NULL;
++	char		nickname[MAXPGPATH];
++
++	/*
++	 * If we have an sslcert configured we use that combined with the token-
++	 * name as the nickname. When no sslcert is set we pass in NULL and let
++	 * NSS try to find the certificate among the ones present in the database.
++	 * Without an sslcert we cannot set the database token since NSS parses
++	 * the given string expecting to find a certificate nickname after the
++	 * colon.
++	 */
++	if (conn->sslcert)
++	{
++		snprintf(nickname, sizeof(nickname), "postgres:%s", conn->sslcert);
++		nnptr = nickname;
++	}
++
++	return NSS_GetClientAuthData(nnptr, socket, caNames, pRetCert, pRetKey);
++}
++
++/*
++ * pg_bad_cert_handler
++ *		Callback for failed certificate validation
++ *
++ * The TLS handshake will call this function iff the server certificate failed
++ * validation. Depending on the sslmode, we allow the connection anyways.
++ */
++static SECStatus
++pg_bad_cert_handler(void *arg, PRFileDesc *fd)
++{
++	PGconn	   *conn = (PGconn *) arg;
++	PRErrorCode err;
++
++	/*
++	 * This really shouldn't happen, as we've set the PGconn object as our
++	 * callback data, and at the callsite we know it will be populated. That
++	 * being said, the NSS code itself performs this check even when it should
++	 * not be required so let's use the same belts with our suspenders.
++	 */
++	if (!arg)
++		return SECFailure;
++
++	err = PORT_GetError();
++
++	/*
++	 * For sslmodes other than verify-full and verify-ca we don't perform peer
++	 * validation, so return immediately.  sslmode require with a database
++	 * specified which contains a CA certificate will work like verify-ca to
++	 * be compatible with the OpenSSL implementation.
++	 */
++	if (strcmp(conn->sslmode, "require") == 0)
++	{
++		if (conn->ssldatabase &&
++			strlen(conn->ssldatabase) > 0 &&
++			certificate_database_has_CA(conn))
++			goto failure;
++	}
++	else if (strcmp(conn->sslmode, "verify-full") == 0 ||
++			 strcmp(conn->sslmode, "verify-ca") == 0)
++		goto failure;
++
++	/*
++	 * TODO: these are relevant error codes that can occur in certificate
++	 * validation, figure out which we don't want for require/prefer etc.
++	 */
++	switch (err)
++	{
++		case SEC_ERROR_INVALID_AVA:
++		case SEC_ERROR_INVALID_TIME:
++		case SEC_ERROR_BAD_SIGNATURE:
++		case SEC_ERROR_EXPIRED_CERTIFICATE:
++		case SEC_ERROR_UNKNOWN_ISSUER:
++		case SEC_ERROR_UNTRUSTED_ISSUER:
++		case SEC_ERROR_UNTRUSTED_CERT:
++		case SEC_ERROR_CERT_VALID:
++		case SEC_ERROR_EXPIRED_ISSUER_CERTIFICATE:
++		case SEC_ERROR_CRL_EXPIRED:
++		case SEC_ERROR_CRL_BAD_SIGNATURE:
++		case SEC_ERROR_EXTENSION_VALUE_INVALID:
++		case SEC_ERROR_CA_CERT_INVALID:
++		case SEC_ERROR_CERT_USAGES_INVALID:
++		case SEC_ERROR_UNKNOWN_CRITICAL_EXTENSION:
++			break;
++		default:
++			goto failure;
++			break;
++	}
++
++	return SECSuccess;
++
++failure:
++	printfPQExpBuffer(&conn->errorMessage,
++					  libpq_gettext("unable to verify certificate: %s"),
++					  pg_SSLerrmessage(err));
++
++	return SECFailure;
++}
++
++/* ------------------------------------------------------------ */
++/*					SSL information functions					*/
++/* ------------------------------------------------------------ */
++
++/*
++ * PQgetssl
++ *
++ * Return NULL as this is legacy and defined to always be equal to calling
++ * PQsslStruct(conn, "OpenSSL"); This should ideally trigger a logged warning
++ * somewhere as it's nonsensical to run in a non-OpenSSL build.
++ */
++void *
++PQgetssl(PGconn *conn)
++{
++	return NULL;
++}
++
++void *
++PQsslStruct(PGconn *conn, const char *struct_name)
++{
++	if (!conn)
++		return NULL;
++
++	/*
++	 * Return the underlying PRFileDesc which can be used to access
++	 * information on the connection details. There is no SSL context per se.
++	 */
++	if (strcmp(struct_name, "NSS") == 0)
++		return conn->pr_fd;
++	return NULL;
++}
++
++const char *const *
++PQsslAttributeNames(PGconn *conn)
++{
++	static const char *const result[] = {
++		"library",
++		"cipher",
++		"protocol",
++		"key_bits",
++		"compression",
++		NULL
++	};
++
++	return result;
++}
++
++const char *
++PQsslAttribute(PGconn *conn, const char *attribute_name)
++{
++	SECStatus	status;
++	SSLChannelInfo channel;
++	SSLCipherSuiteInfo suite;
++
++	if (!conn || !conn->pr_fd)
++		return NULL;
++
++	if (strcmp(attribute_name, "library") == 0)
++		return "NSS";
++
++	status = SSL_GetChannelInfo(conn->pr_fd, &channel, sizeof(channel));
++	if (status != SECSuccess)
++		return NULL;
++
++	status = SSL_GetCipherSuiteInfo(channel.cipherSuite, &suite, sizeof(suite));
++	if (status != SECSuccess)
++		return NULL;
++
++	if (strcmp(attribute_name, "cipher") == 0)
++		return suite.cipherSuiteName;
++
++	if (strcmp(attribute_name, "key_bits") == 0)
++	{
++		static char key_bits_str[8];
++
++		snprintf(key_bits_str, sizeof(key_bits_str), "%i", suite.effectiveKeyBits);
++		return key_bits_str;
++	}
++
++	if (strcmp(attribute_name, "protocol") == 0)
++		return ssl_protocol_version_to_string(channel.protocolVersion);
++
++	/*
++	 * NSS disabled support for compression in version 3.33, and it was only
++	 * available for SSLv3 at that point anyways, so we can safely return off
++	 * here without even checking.
++	 */
++	if (strcmp(attribute_name, "compression") == 0)
++		return "off";
++
++	return NULL;
++}
++
++/*
++ * ssl_protocol_param_to_nss
++ *
++ * Return the NSS internal representation of the protocol asked for by the
++ * user as a connection parameter.
++ */
++static int
++ssl_protocol_param_to_nss(const char *protocol)
++{
++	if (pg_strcasecmp("TLSv1", protocol) == 0)
++		return SSL_LIBRARY_VERSION_TLS_1_0;
++
++#ifdef SSL_LIBRARY_VERSION_TLS_1_1
++	if (pg_strcasecmp("TLSv1.1", protocol) == 0)
++		return SSL_LIBRARY_VERSION_TLS_1_1;
++#endif
++
++#ifdef SSL_LIBRARY_VERSION_TLS_1_2
++	if (pg_strcasecmp("TLSv1.2", protocol) == 0)
++		return SSL_LIBRARY_VERSION_TLS_1_2;
++#endif
++
++#ifdef SSL_LIBRARY_VERSION_TLS_1_3
++	if (pg_strcasecmp("TLSv1.3", protocol) == 0)
++		return SSL_LIBRARY_VERSION_TLS_1_3;
++#endif
++
++	return -1;
++}
++
++/*
++ * certificate_database_has_CA
++ *		 Check for the presence of a CA certificate
++ *
++ * Returns true in case there is a CA certificate in the database connected
++ * to in the conn object, else false. This function only checks for the
++ * presence of a CA certificate, not it's validity and/or usefulness.
++ */
++static bool
++certificate_database_has_CA(PGconn *conn)
++{
++	CERTCertList *certificates;
++	bool		hasCA;
++
++	/*
++	 * If the certificate database has a password we must provide it, since
++	 * this API doesn't invoke the standard password callback.
++	 */
++	if (conn->has_password)
++		certificates = PK11_ListCerts(PK11CertListCA, PQssl_passwd_cb(NULL, PR_FALSE, (void *) conn));
++	else
++		certificates = PK11_ListCerts(PK11CertListCA, NULL);
++	hasCA = !CERT_LIST_EMPTY(certificates);
++	CERT_DestroyCertList(certificates);
++
++	return hasCA;
++}
++
++PQsslKeyPassHook_nss_type
++PQgetSSLKeyPassHook_nss(void)
++{
++	return PQsslKeyPassHook;
++}
++
++void
++PQsetSSLKeyPassHook_nss(PQsslKeyPassHook_nss_type hook)
++{
++	PQsslKeyPassHook = hook;
++}
++
++/*
++ * PQssl_passwd_cb
++ *		 Supply a password to decrypt an object
++ *
++ * If an object in the NSS database is password protected, or if the entire
++ * NSS database is itself password protected, this callback will be invoked.
++ *
++ * This must match NSS type PK11PasswordFunc.
++ */
++static char *
++PQssl_passwd_cb(PK11SlotInfo *slot, PRBool retry, void *arg)
++{
++	PGconn	   *conn = (PGconn *) arg;
++
++	conn->has_password = true;
++
++	if (PQsslKeyPassHook)
++		return PQsslKeyPassHook(slot, (PRBool) retry, arg);
++	else
++		return PQdefaultSSLKeyPassHook_nss(slot, retry, arg);
++}
++
++/*
++ * PQdefaultSSLKeyPassHook_nss
++ * 		 Default password handler callback
++ *
++ * If no user defined password callback has been set up, the callback below
++ * will try the password set by the sslpassword parameter. Since we by legacy
++ * only have support for a single password, there is little reason to inspect
++ * the slot for the object in question. A TODO is to support different
++ * passwords for different objects, either via a DSL in sslpassword or with a
++ * new key/value style parameter. Users can supply their own password hook to
++ * do this of course, but it would be nice to support something in core too.
++ */
++char *
++PQdefaultSSLKeyPassHook_nss(PK11SlotInfo *slot, PRBool retry, void *arg)
++{
++	PGconn	   *conn = (PGconn *) arg;
++
++	/*
++	 * If the password didn't work the first time there is no point in
++	 * retrying as it hasn't changed.
++	 */
++	if (retry != PR_TRUE && conn->sslpassword && strlen(conn->sslpassword) > 0)
++		return PORT_Strdup(conn->sslpassword);
++
++	return NULL;
++}
+diff --git a/src/interfaces/libpq/fe-secure.c b/src/interfaces/libpq/fe-secure.c
+index b15d8d137c..d76eb4806f 100644
+--- a/src/interfaces/libpq/fe-secure.c
++++ b/src/interfaces/libpq/fe-secure.c
+@@ -447,6 +447,27 @@ PQdefaultSSLKeyPassHook_OpenSSL(char *buf, int size, PGconn *conn)
+ }
+ #endif							/* USE_OPENSSL */
+ 
++#ifndef USE_NSS
++
++PQsslKeyPassHook_nss_type
++PQgetSSLKeyPassHook_nss(void)
++{
++	return NULL;
++}
++
++void
++PQsetSSLKeyPassHook_nss(PQsslKeyPassHook_nss_type hook)
++{
++	return;
++}
++
++char *
++PQdefaultSSLKeyPassHook_nss(PK11SlotInfo * slot, PRBool retry, void *arg)
++{
++	return NULL;
++}
++#endif							/* USE_NSS */
++
+ /* Dummy version of GSSAPI information functions, when built without GSS support */
+ #ifndef ENABLE_GSS
+ 
+diff --git a/src/interfaces/libpq/libpq-fe.h b/src/interfaces/libpq/libpq-fe.h
+index a6fd69aceb..186e0a28f4 100644
+--- a/src/interfaces/libpq/libpq-fe.h
++++ b/src/interfaces/libpq/libpq-fe.h
+@@ -665,6 +665,17 @@ extern PQsslKeyPassHook_OpenSSL_type PQgetSSLKeyPassHook_OpenSSL(void);
+ extern void PQsetSSLKeyPassHook_OpenSSL(PQsslKeyPassHook_OpenSSL_type hook);
+ extern int	PQdefaultSSLKeyPassHook_OpenSSL(char *buf, int size, PGconn *conn);
+ 
++/* == in fe-secure-nss.c === */
++typedef struct PK11SlotInfoStr PK11SlotInfo;
++typedef int PRIntn;
++typedef PRIntn PRBool;
++
++/* Support for overriding sslpassword handling with a callback */
++typedef char *(*PQsslKeyPassHook_nss_type) (PK11SlotInfo *slot, PRBool retry, void *arg);
++extern PQsslKeyPassHook_nss_type PQgetSSLKeyPassHook_nss(void);
++extern void PQsetSSLKeyPassHook_nss(PQsslKeyPassHook_nss_type hook);
++extern char *PQdefaultSSLKeyPassHook_nss(PK11SlotInfo *slot, PRBool retry, void *arg);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/interfaces/libpq/libpq-int.h b/src/interfaces/libpq/libpq-int.h
+index 490458adef..ab0da13700 100644
+--- a/src/interfaces/libpq/libpq-int.h
++++ b/src/interfaces/libpq/libpq-int.h
+@@ -81,6 +81,10 @@ typedef struct
+ #endif
+ #endif							/* USE_OPENSSL */
+ 
++#ifdef USE_NSS
++#include "common/nss.h"
++#endif
++
+ /*
+  * POSTGRES backend dependent Constants.
+  */
+@@ -385,6 +389,7 @@ struct pg_conn
+ 	char	   *sslcrl;			/* certificate revocation list filename */
+ 	char	   *sslcrldir;		/* certificate revocation list directory name */
+ 	char	   *sslsni;			/* use SSL SNI extension (0 or 1) */
++	char	   *ssldatabase;	/* NSS certificate/key database */
+ 	char	   *requirepeer;	/* required peer credentials for local sockets */
+ 	char	   *gssencmode;		/* GSS mode (require,prefer,disable) */
+ 	char	   *krbsrvname;		/* Kerberos service name */
+@@ -526,6 +531,28 @@ struct pg_conn
+ 								 * removed as this locking is handled
+ 								 * internally in OpenSSL >= 1.1.0. */
+ #endif							/* USE_OPENSSL */
++
++/*
++ * The NSS/NSPR specific types aren't used to avoid pulling in the required
++ * headers here, as they are causing conflicts with PG definitions.
++ */
++#ifdef USE_NSS
++	NSSInitContext	   *nss_context;	/* NSS connection specific context */
++	PRFileDesc		   *pr_fd;			/* NSPR file descriptor for the connection */
++
++	/*
++	 * Track whether the NSS database has a password set or not. There is no
++	 * API function for retrieving password status of a database, but we need
++	 * to know since some NSS API calls require the password passed in (they
++	 * don't call the callback themselves). To track, we simply flip this to
++	 * true in case NSS invoked the password callback - as that will only
++	 * happen in case there is a password. The reason for tracking this is
++	 * that there are calls which require a password parameter, but doesn't
++	 * use the callbacks provided, so we must call the callback on behalf of
++	 * these.
++	 */
++	bool		has_password;
++#endif							/* USE_NSS */
+ #endif							/* USE_SSL */
+ 
+ #ifdef ENABLE_GSS
+@@ -780,7 +807,7 @@ extern ssize_t pgtls_write(PGconn *conn, const void *ptr, size_t len);
+  * This is not supported with old versions of OpenSSL that don't have
+  * the X509_get_signature_nid() function.
+  */
+-#if defined(USE_OPENSSL) && defined(HAVE_X509_GET_SIGNATURE_NID)
++#if defined(USE_NSS) || (defined(USE_OPENSSL) && defined(HAVE_X509_GET_SIGNATURE_NID))
+ #define HAVE_PGTLS_GET_PEER_CERTIFICATE_HASH
+ extern char *pgtls_get_peer_certificate_hash(PGconn *conn, size_t *len);
+ #endif
+-- 
+2.24.3 (Apple Git-128)
+

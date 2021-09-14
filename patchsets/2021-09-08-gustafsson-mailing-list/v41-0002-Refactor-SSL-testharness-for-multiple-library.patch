@@ -1,0 +1,401 @@
+From 03035ced745bc92f630f0c52f8b4ffc732b192b1 Mon Sep 17 00:00:00 2001
+From: Daniel Gustafsson <daniel@yesql.se>
+Date: Mon, 8 Feb 2021 23:52:34 +0100
+Subject: [PATCH v41 02/10] Refactor SSL testharness for multiple library
+
+The SSL testharness was fully tied to OpenSSL in the way the server was
+set up and reconfigured. This refactors the SSLServer module into a SSL
+library agnostic SSL/Server module which in turn use SSL/Backend/<lib>
+modules for the implementation details.
+
+No changes are done to the actual tests, this only change how setup and
+teardown is performed.
+---
+ src/test/ssl/t/001_ssltests.pl                |  56 ++--------
+ src/test/ssl/t/002_scram.pl                   |   6 +-
+ src/test/ssl/t/SSL/Backend/OpenSSL.pm         | 103 ++++++++++++++++++
+ .../ssl/t/{SSLServer.pm => SSL/Server.pm}     |  83 +++++++++++---
+ 4 files changed, 181 insertions(+), 67 deletions(-)
+ create mode 100644 src/test/ssl/t/SSL/Backend/OpenSSL.pm
+ rename src/test/ssl/t/{SSLServer.pm => SSL/Server.pm} (78%)
+
+diff --git a/src/test/ssl/t/001_ssltests.pl b/src/test/ssl/t/001_ssltests.pl
+index 3bc711f4a7..35184cd80c 100644
+--- a/src/test/ssl/t/001_ssltests.pl
++++ b/src/test/ssl/t/001_ssltests.pl
+@@ -7,12 +7,10 @@ use PostgresNode;
+ use TestLib;
+ use Test::More;
+ 
+-use File::Copy;
+-
+ use FindBin;
+ use lib $FindBin::RealBin;
+ 
+-use SSLServer;
++use SSL::Server;
+ 
+ if ($ENV{with_ssl} ne 'openssl')
+ {
+@@ -35,32 +33,6 @@ my $SERVERHOSTCIDR = '127.0.0.1/32';
+ # Allocation of base connection string shared among multiple tests.
+ my $common_connstr;
+ 
+-# The client's private key must not be world-readable, so take a copy
+-# of the key stored in the code tree and update its permissions.
+-#
+-# This changes ssl/client.key to ssl/client_tmp.key etc for the rest
+-# of the tests.
+-my @keys = (
+-	"client",               "client-revoked",
+-	"client-der",           "client-encrypted-pem",
+-	"client-encrypted-der", "client-dn");
+-foreach my $key (@keys)
+-{
+-	copy("ssl/${key}.key", "ssl/${key}_tmp.key")
+-	  or die
+-	  "couldn't copy ssl/${key}.key to ssl/${key}_tmp.key for permissions change: $!";
+-	chmod 0600, "ssl/${key}_tmp.key"
+-	  or die "failed to change permissions on ssl/${key}_tmp.key: $!";
+-}
+-
+-# Also make a copy of that explicitly world-readable.  We can't
+-# necessarily rely on the file in the source tree having those
+-# permissions.  Add it to @keys to include it in the final clean
+-# up phase.
+-copy("ssl/client.key", "ssl/client_wrongperms_tmp.key");
+-chmod 0644, "ssl/client_wrongperms_tmp.key";
+-push @keys, 'client_wrongperms';
+-
+ #### Set up the server.
+ 
+ note "setting up data directory";
+@@ -75,32 +47,22 @@ $node->start;
+ 
+ # Run this before we lock down access below.
+ my $result = $node->safe_psql('postgres', "SHOW ssl_library");
+-is($result, 'OpenSSL', 'ssl_library parameter');
++is($result, SSL::Server::ssl_library(), 'ssl_library parameter');
+ 
+ configure_test_server_for_ssl($node, $SERVERHOSTADDR, $SERVERHOSTCIDR,
+ 	'trust');
+ 
+ note "testing password-protected keys";
+ 
+-open my $sslconf, '>', $node->data_dir . "/sslconfig.conf";
+-print $sslconf "ssl=on\n";
+-print $sslconf "ssl_cert_file='server-cn-only.crt'\n";
+-print $sslconf "ssl_key_file='server-password.key'\n";
+-print $sslconf "ssl_passphrase_command='echo wrongpassword'\n";
+-close $sslconf;
+-
++set_server_cert($node, 'server-cn-only', 'root+client_ca',
++				   'server-password', 'echo wrongpassword');
+ command_fails(
+ 	[ 'pg_ctl', '-D', $node->data_dir, '-l', $node->logfile, 'restart' ],
+ 	'restart fails with password-protected key file with wrong password');
+ $node->_update_pid(0);
+ 
+-open $sslconf, '>', $node->data_dir . "/sslconfig.conf";
+-print $sslconf "ssl=on\n";
+-print $sslconf "ssl_cert_file='server-cn-only.crt'\n";
+-print $sslconf "ssl_key_file='server-password.key'\n";
+-print $sslconf "ssl_passphrase_command='echo secret1'\n";
+-close $sslconf;
+-
++set_server_cert($node, 'server-cn-only', 'root+client_ca',
++				'server-password', 'echo secret1');
+ command_ok(
+ 	[ 'pg_ctl', '-D', $node->data_dir, '-l', $node->logfile, 'restart' ],
+ 	'restart succeeds with password-protected key file');
+@@ -586,7 +548,5 @@ $node->connect_fails(
+ 	expected_stderr => qr/SSL error: sslv3 alert certificate revoked/);
+ 
+ # clean up
+-foreach my $key (@keys)
+-{
+-	unlink("ssl/${key}_tmp.key");
+-}
++
++SSL::Server::cleanup();
+diff --git a/src/test/ssl/t/002_scram.pl b/src/test/ssl/t/002_scram.pl
+index 1dfa2b91f3..e05e60f092 100644
+--- a/src/test/ssl/t/002_scram.pl
++++ b/src/test/ssl/t/002_scram.pl
+@@ -14,11 +14,11 @@ use File::Copy;
+ use FindBin;
+ use lib $FindBin::RealBin;
+ 
+-use SSLServer;
++use SSL::Server;
+ 
+ if ($ENV{with_ssl} ne 'openssl')
+ {
+-	plan skip_all => 'OpenSSL not supported by this build';
++	plan skip_all => 'SSL not supported by this build';
+ }
+ 
+ # This is the hostname used to connect to the server.
+@@ -115,5 +115,3 @@ $node->connect_ok(
+ 
+ # clean up
+ unlink($client_tmp_key);
+-
+-done_testing($number_of_tests);
+diff --git a/src/test/ssl/t/SSL/Backend/OpenSSL.pm b/src/test/ssl/t/SSL/Backend/OpenSSL.pm
+new file mode 100644
+index 0000000000..e77ee25cc7
+--- /dev/null
++++ b/src/test/ssl/t/SSL/Backend/OpenSSL.pm
+@@ -0,0 +1,103 @@
++package SSL::Backend::OpenSSL;
++
++use strict;
++use warnings;
++use Exporter;
++use File::Copy;
++
++our @ISA       = qw(Exporter);
++our @EXPORT_OK = qw(get_new_openssl_backend);
++
++our (@keys);
++
++INIT
++{
++	@keys = (
++		"client",               "client-revoked",
++		"client-der",           "client-encrypted-pem",
++		"client-encrypted-der", "client-dn");
++}
++
++sub new
++{
++	my ($class) = @_;
++
++	my $self = { _library => 'OpenSSL' };
++
++	bless $self, $class;
++
++	return $self;
++}
++
++sub get_new_openssl_backend
++{
++	my $class = 'SSL::Backend::OpenSSL';
++
++	my $backend = $class->new();
++
++	return $backend;
++}
++
++sub init
++{
++	# The client's private key must not be world-readable, so take a copy
++	# of the key stored in the code tree and update its permissions.
++	#
++	# This changes ssl/client.key to ssl/client_tmp.key etc for the rest
++	# of the tests.
++	my @keys = (
++		"client",               "client-revoked",
++		"client-der",           "client-encrypted-pem",
++		"client-encrypted-der", "client-dn");
++	foreach my $key (@keys)
++	{
++		copy("ssl/${key}.key", "ssl/${key}_tmp.key")
++		  or die
++		  "couldn't copy ssl/${key}.key to ssl/${key}_tmp.key for permissions change: $!";
++		chmod 0600, "ssl/${key}_tmp.key"
++		  or die "failed to change permissions on ssl/${key}_tmp.key: $!";
++	}
++
++	# Also make a copy of that explicitly world-readable.  We can't
++	# necessarily rely on the file in the source tree having those
++	# permissions.  Add it to @keys to include it in the final clean
++	# up phase.
++	copy("ssl/client.key", "ssl/client_wrongperms_tmp.key");
++	chmod 0644, "ssl/client_wrongperms_tmp.key";
++	push @keys, 'client_wrongperms';
++}
++
++# Change the configuration to use given server cert file, and reload
++# the server so that the configuration takes effect.
++sub set_server_cert
++{
++	my $self     = $_[0];
++	my $certfile = $_[1];
++	my $cafile   = $_[2] || "root+client_ca";
++	my $keyfile  = $_[3] || $certfile;
++
++	my $sslconf =
++	    "ssl_ca_file='$cafile.crt'\n"
++	  . "ssl_cert_file='$certfile.crt'\n"
++	  . "ssl_key_file='$keyfile.key'\n"
++	  . "ssl_crl_file='root+client.crl'\n";
++
++	return $sslconf;
++}
++
++sub get_library
++{
++	my ($self) = @_;
++
++	return $self->{_library};
++}
++
++sub cleanup
++{
++	foreach my $key (@keys)
++	{
++		unlink("ssl/${key}_tmp.key");
++	}
++}
++
++1;
+diff --git a/src/test/ssl/t/SSLServer.pm b/src/test/ssl/t/SSL/Server.pm
+similarity index 78%
+rename from src/test/ssl/t/SSLServer.pm
+rename to src/test/ssl/t/SSL/Server.pm
+index 804d008245..33bf351476 100644
+--- a/src/test/ssl/t/SSLServer.pm
++++ b/src/test/ssl/t/SSL/Server.pm
+@@ -26,19 +26,39 @@
+ # explicitly because an invalid sslcert or sslrootcert, respectively,
+ # causes those to be ignored.)
+ 
+-package SSLServer;
++package SSL::Server;
+ 
+ use strict;
+ use warnings;
+ use PostgresNode;
++use RecursiveCopy;
+ use TestLib;
+ use File::Basename;
+ use File::Copy;
+ use Test::More;
++use SSL::Backend::OpenSSL qw(get_new_openssl_backend);
++use SSL::Backend::NSS qw(get_new_nss_backend);
++
++our ($openssl, $nss, $backend);
++
++# The TLS backend which the server is using should be mostly transparent for
++# the user, apart from individual configuration settings, so keep the backend
++# specific things abstracted behind SSL::Server.
++if ($ENV{with_ssl} eq 'openssl')
++{
++	$backend = get_new_openssl_backend();
++	$openssl = 1;
++}
++elsif ($ENV{with_ssl} eq 'nss')
++{
++	$backend = get_new_nss_backend();
++	$nss     = 1;
++}
+ 
+ use Exporter 'import';
+ our @EXPORT = qw(
+   configure_test_server_for_ssl
++  set_server_cert
+   switch_server_cert
+ );
+ 
+@@ -112,14 +132,21 @@ sub configure_test_server_for_ssl
+ 	close $sslconf;
+ 
+ 	# Copy all server certificates and keys, and client root cert, to the data dir
+-	copy_files("ssl/server-*.crt", $pgdata);
+-	copy_files("ssl/server-*.key", $pgdata);
+-	chmod(0600, glob "$pgdata/server-*.key") or die $!;
+-	copy_files("ssl/root+client_ca.crt", $pgdata);
+-	copy_files("ssl/root_ca.crt",        $pgdata);
+-	copy_files("ssl/root+client.crl",    $pgdata);
+-	mkdir("$pgdata/root+client-crldir");
+-	copy_files("ssl/root+client-crldir/*", "$pgdata/root+client-crldir/");
++	if (defined($openssl))
++	{
++		copy_files("ssl/server-*.crt", $pgdata);
++		copy_files("ssl/server-*.key", $pgdata);
++		chmod(0600, glob "$pgdata/server-*.key") or die $!;
++		copy_files("ssl/root+client_ca.crt", $pgdata);
++		copy_files("ssl/root_ca.crt",        $pgdata);
++		copy_files("ssl/root+client.crl",    $pgdata);
++		mkdir("$pgdata/root+client-crldir");
++		copy_files("ssl/root+client-crldir/*", "$pgdata/root+client-crldir/");
++	}
++	elsif (defined($nss))
++	{
++		RecursiveCopy::copypath("ssl/nss", $pgdata . "/nss") if -e "ssl/nss";
++	}
+ 
+ 	# Stop and restart server to load new listen_addresses.
+ 	$node->restart;
+@@ -127,20 +154,36 @@ sub configure_test_server_for_ssl
+ 	# Change pg_hba after restart because hostssl requires ssl=on
+ 	configure_hba_for_ssl($node, $servercidr, $authmethod);
+ 
++	# Finally, perform backend specific configuration
++	$backend->init();
++
+ 	return;
+ }
+ 
+-# Change the configuration to use given server cert file, and reload
+-# the server so that the configuration takes effect.
+-sub switch_server_cert
++sub ssl_library
++{
++	return $backend->get_library();
++}
++
++sub cleanup
++{
++	$backend->cleanup();
++}
++
++# Change the configuration to use given server cert file,
++sub set_server_cert
+ {
+ 	my $node     = $_[0];
+ 	my $certfile = $_[1];
+ 	my $cafile   = $_[2] || "root+client_ca";
++	my $keyfile  = $_[3] || '';
++	my $pwcmd    = $_[4] || '';
+ 	my $crlfile  = "root+client.crl";
+ 	my $crldir;
+ 	my $pgdata = $node->data_dir;
+ 
++	$keyfile = $certfile if $keyfile eq '';
++
+ 	# defaults to use crl file
+ 	if (defined $_[3] || defined $_[4])
+ 	{
+@@ -150,13 +193,23 @@ sub switch_server_cert
+ 
+ 	open my $sslconf, '>', "$pgdata/sslconfig.conf";
+ 	print $sslconf "ssl=on\n";
+-	print $sslconf "ssl_ca_file='$cafile.crt'\n";
+-	print $sslconf "ssl_cert_file='$certfile.crt'\n";
+-	print $sslconf "ssl_key_file='$certfile.key'\n";
++	print $sslconf $backend->set_server_cert($certfile, $cafile, $keyfile);
+ 	print $sslconf "ssl_crl_file='$crlfile'\n" if defined $crlfile;
+ 	print $sslconf "ssl_crl_dir='$crldir'\n"   if defined $crldir;
++	print $sslconf "ssl_passphrase_command='$pwcmd'\n"
++	  unless $pwcmd eq '';
+ 	close $sslconf;
++	return;
++}
+ 
++# Change the configuration to use given server cert file, and reload
++# the server so that the configuration takes effect.
++# Takes the same arguments as set_server_cert, which it calls to do that
++# piece of the work.
++sub switch_server_cert
++{
++	my $node = $_[0];
++	set_server_cert(@_);
+ 	$node->restart;
+ 	return;
+ }
+-- 
+2.24.3 (Apple Git-128)
+
