@@ -7,7 +7,9 @@ need to implement - see NOTES.md for details.
 
 ### Implementation steps
 
-1) Get Postgres compiling with stub functions that don't do anything.
+1) Get the Postgres frontend compiling with stub functions that don't do
+anything. The backend will still compile using NSS (ie we'll compile in both
+libraries until we have them both working.)
 
 2) Try to implement the functions.
 
