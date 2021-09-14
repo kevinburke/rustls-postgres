@@ -21,6 +21,12 @@ pgtls_read -1 bytes, got err 2, ecode 0
 pgtls_read result errno 0, returned n 0
 ```
 
+OpenSSL compilation instructions:
+
+```
+LDFLAGS="-L/usr/local/opt/openssl@1.1/lib" CPPFLAGS="-I/usr/local/opt/openssl@1.1/include" ./configure --prefix=$HOME/pq-master --with-openssl && gmake && PATH=/bin:$PATH gmake install
+```
+
 ### September 7, 2021
 
 Needed to also implement these functions in the frontend
