@@ -1,3 +1,26 @@
+### September 14, 2021
+
+Here's the startup sequence of reads and writes from OpenSSL, which is
+negotiating TLS 1.3.
+
+"Err 2" here is `SSL_ERROR_WANT_READ`, in which case we set 0 error on the
+socket and return 0 bytes read.
+
+```
+pgtls_write 81 bytes, got err 0
+pgtls_write result errno 0, returned n 81
+pgtls_read -1 bytes, got err 2, ecode 0
+pgtls_read result errno 0, returned n 0
+pgtls_read 335 bytes, got err 0, ecode 0
+pgtls_read result errno 0, returned n 335
+pgtls_write 200 bytes, got err 0
+pgtls_write result errno 0, returned n 200
+pgtls_read 120 bytes, got err 0, ecode 0
+pgtls_read result errno 0, returned n 120
+pgtls_read -1 bytes, got err 2, ecode 0
+pgtls_read result errno 0, returned n 0
+```
+
 ### September 7, 2021
 
 Needed to also implement these functions in the frontend
