@@ -7,14 +7,19 @@ negotiating TLS 1.3.
 socket and return 0 bytes read.
 
 ```
+pgtls_read_pending 0 bytes
+pgtls_read_pending 0 bytes
 pgtls_write 81 bytes, got err 0
 pgtls_write result errno 0, returned n 81
+pgtls_read_pending 0 bytes
 pgtls_read -1 bytes, got err 2, ecode 0
 pgtls_read result errno 0, returned n 0
+pgtls_read_pending 0 bytes
 pgtls_read 335 bytes, got err 0, ecode 0
 pgtls_read result errno 0, returned n 335
 pgtls_write 200 bytes, got err 0
 pgtls_write result errno 0, returned n 200
+pgtls_read_pending 0 bytes
 pgtls_read 120 bytes, got err 0, ecode 0
 pgtls_read result errno 0, returned n 120
 pgtls_read -1 bytes, got err 2, ecode 0
@@ -26,6 +31,16 @@ OpenSSL compilation instructions:
 ```
 LDFLAGS="-L/usr/local/opt/openssl@1.1/lib" CPPFLAGS="-I/usr/local/opt/openssl@1.1/include" ./configure --prefix=$HOME/pq-master --with-openssl && gmake && PATH=/bin:$PATH gmake install
 ```
+
+why does pgtls_write on Rust want to write/write only 60 bytes?
+
+on master, with the same printing instructions, we write:
+
+"Quserkevindatabasepostgresapplication_namepsqlclient_encodingUTF8"
+
+on Rust branch we write:
+
+^@^@^@<^@^C^@^@user^@kevin^@database^@postgres^@application_name^@psql^@^@
 
 ### September 7, 2021
 
