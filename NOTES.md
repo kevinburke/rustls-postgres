@@ -1,3 +1,11 @@
+### September 16, 2021
+
+Including unistd.h, _or_ sleeping for 1 second, causes psql to send the right
+sequence - with UTF8 and the Q at the beginning.
+
+Sleeping for 1 second makes the output much more reasonable. We see the 335
+bytes being read in rustls, but then we see the same preamble being sent later.
+
 ### September 14, 2021
 
 Here's the startup sequence of reads and writes from OpenSSL, which is
