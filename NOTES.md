@@ -1,3 +1,12 @@
+### October 1, 2021
+
+To run the SSL tests, run
+
+```
+cd src/test/ssl
+make check
+```
+
 ### September 16, 2021
 
 Including unistd.h, _or_ sleeping for 1 second, causes psql to send the right
