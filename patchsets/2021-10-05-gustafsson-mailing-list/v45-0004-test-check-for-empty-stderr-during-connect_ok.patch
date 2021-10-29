@@ -1,0 +1,128 @@
+From 678606499a83c9787c708bba7a676096dc9b0062 Mon Sep 17 00:00:00 2001
+From: Jacob Champion <pchampion@vmware.com>
+Date: Sat, 19 Jun 2021 01:37:30 +0200
+Subject: [PATCH v45 04/10] test: check for empty stderr during connect_ok()
+
+...in a similar manner to command_like(), to catch notices-as-errors
+coming from NSS.
+---
+ src/test/authentication/t/001_password.pl | 2 +-
+ src/test/authentication/t/002_saslprep.pl | 2 +-
+ src/test/kerberos/t/001_auth.pl           | 2 +-
+ src/test/ldap/t/001_auth.pl               | 2 +-
+ src/test/perl/PostgresNode.pm             | 5 ++++-
+ src/test/ssl/t/001_ssltests.pl            | 4 ++--
+ src/test/ssl/t/002_scram.pl               | 4 ++--
+ 7 files changed, 12 insertions(+), 9 deletions(-)
+
+diff --git a/src/test/authentication/t/001_password.pl b/src/test/authentication/t/001_password.pl
+index 16570a4e2c..bfea8bb8ae 100644
+--- a/src/test/authentication/t/001_password.pl
++++ b/src/test/authentication/t/001_password.pl
+@@ -20,7 +20,7 @@ if (!$use_unix_sockets)
+ }
+ else
+ {
+-	plan tests => 23;
++	plan tests => 32;
+ }
+ 
+ 
+diff --git a/src/test/authentication/t/002_saslprep.pl b/src/test/authentication/t/002_saslprep.pl
+index acd379df31..9457277094 100644
+--- a/src/test/authentication/t/002_saslprep.pl
++++ b/src/test/authentication/t/002_saslprep.pl
+@@ -17,7 +17,7 @@ if (!$use_unix_sockets)
+ }
+ else
+ {
+-	plan tests => 12;
++	plan tests => 20;
+ }
+ 
+ # Delete pg_hba.conf from the given node, add a new entry to it
+diff --git a/src/test/kerberos/t/001_auth.pl b/src/test/kerberos/t/001_auth.pl
+index c484237d07..a5afdc8680 100644
+--- a/src/test/kerberos/t/001_auth.pl
++++ b/src/test/kerberos/t/001_auth.pl
+@@ -23,7 +23,7 @@ use Time::HiRes qw(usleep);
+ 
+ if ($ENV{with_gssapi} eq 'yes')
+ {
+-	plan tests => 44;
++	plan tests => 54;
+ }
+ else
+ {
+diff --git a/src/test/ldap/t/001_auth.pl b/src/test/ldap/t/001_auth.pl
+index f670bc5e0d..d7f49739dd 100644
+--- a/src/test/ldap/t/001_auth.pl
++++ b/src/test/ldap/t/001_auth.pl
+@@ -9,7 +9,7 @@ use Test::More;
+ 
+ if ($ENV{with_ldap} eq 'yes')
+ {
+-	plan tests => 28;
++	plan tests => 40;
+ }
+ else
+ {
+diff --git a/src/test/perl/PostgresNode.pm b/src/test/perl/PostgresNode.pm
+index c59da758c7..01762be2ff 100644
+--- a/src/test/perl/PostgresNode.pm
++++ b/src/test/perl/PostgresNode.pm
+@@ -2055,8 +2055,11 @@ sub connect_ok
+ 
+ 	if (defined($params{expected_stdout}))
+ 	{
+-		like($stdout, $params{expected_stdout}, "$test_name: matches");
++		like($stdout, $params{expected_stdout}, "$test_name: stdout matches");
+ 	}
++
++	is($stderr, "", "$test_name: no stderr");
++
+ 	if (@log_like or @log_unlike)
+ 	{
+ 		my $log_contents = TestLib::slurp_file($self->logfile, $log_location);
+diff --git a/src/test/ssl/t/001_ssltests.pl b/src/test/ssl/t/001_ssltests.pl
+index f961ba9737..dc21ae9d1e 100644
+--- a/src/test/ssl/t/001_ssltests.pl
++++ b/src/test/ssl/t/001_ssltests.pl
+@@ -18,12 +18,12 @@ my $nss;
+ if ($ENV{with_ssl} eq 'openssl')
+ {
+ 	$openssl = 1;
+-	plan tests => 112;
++	plan tests => 144;
+ }
+ elsif ($ENV{with_ssl} eq 'nss')
+ {
+ 	$nss = 1;
+-	plan tests => 112;
++	plan tests => 138;
+ }
+ else
+ {
+diff --git a/src/test/ssl/t/002_scram.pl b/src/test/ssl/t/002_scram.pl
+index 2bfe0b3573..0dd286b339 100644
+--- a/src/test/ssl/t/002_scram.pl
++++ b/src/test/ssl/t/002_scram.pl
+@@ -27,13 +27,13 @@ if ($ENV{with_ssl} eq 'openssl')
+ 	# Determine whether build supports tls-server-end-point.
+ 	$supports_tls_server_end_point =
+ 		check_pg_config("#define HAVE_X509_GET_SIGNATURE_NID 1");
+-	plan tests => $supports_tls_server_end_point ? 11 : 12;
++	plan tests => 15;
+ }
+ elsif ($ENV{with_ssl} eq 'nss')
+ {
+ 	$nss = 1;
+ 	$supports_tls_server_end_point = 1;
+-	plan tests => 11;
++	plan tests => 15;
+ }
+ else
+ {
+-- 
+2.24.3 (Apple Git-128)
+

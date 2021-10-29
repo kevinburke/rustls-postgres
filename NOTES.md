@@ -1,3 +1,11 @@
+### October 28, 2021
+
+Took a break for a while! The latest libnss patchset didn't merge cleanly
+against master, so I posted on the mailing list and got a clean one in the
+morning.
+
+Fixed an error in Rust coreutils that was causing "make clean" to fail.
+
 ### October 1, 2021
 
 To run the SSL tests, run
