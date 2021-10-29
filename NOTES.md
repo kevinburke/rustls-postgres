@@ -1,3 +1,14 @@
+### October 29, 2021
+
+Followed these steps to get vim and rust working together:
+
+https://petermalmgren.com/rc-batch-day-9/
+
+Some of the API's in rustls-ffi changed so I'm working through that.
+
+https://github.com/rustls/rustls-ffi/issues/159
+https://github.com/rustls/rustls-ffi/issues/161
+
 ### October 28, 2021
 
 Took a break for a while! The latest libnss patchset didn't merge cleanly
