@@ -59,9 +59,26 @@ will have to change some of these paths - the ones that say e.g. /Users/kevin.
 LDFLAGS="-L/usr/local/opt/nss/lib -L/usr/local/opt/nspr/lib -L/Users/kevin/src/github.com/rustls/rustls-ffi/target/lib" \
     CFLAGS="-framework Security" \
     CPPFLAGS="-framework Security -I/usr/local/opt/nss/include -I/usr/local/opt/nspr/include -I/Users/kevin/src/github.com/rustls/rustls-ffi/target/include" \
-    ./configure --prefix=$HOME/pq --with-ssl=rustls && \
+    ./configure --prefix=$HOME/pq --with-ssl=rustls --enable-tap-tests \
+        --enable-debug && \
     gmake && \
     PATH=/bin:$PATH gmake install
 ```
 
+On subsequent calls you don't need to invoke `configure`, you only need to rerun:
+
+    ```
+    gmake && PATH=/bin:$PATH gmake install
+    ```
+
+7. Connect to the local Postgres database using your new `psql`:
+
+```
+~/pq/bin/psql 'sslmode=verify-full sslrootcert=/Users/kevin/src/github.com/path/to/roots/root.pem host=cert_host.example.com ssl_min_protocol_version=TLSv1.2 dbname=postgres'
+```
+
 [patches]: https://postgrespro.com/list/thread-id/2492594#1538bd8894fc723d97d5c41b9d4bb8feb9db0d43.camel@j-davis.com
+
+#### Running SSL tests
+
+You need to install additional Perl modules to run the TLS tests.

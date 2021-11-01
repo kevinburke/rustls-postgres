@@ -8,6 +8,8 @@ Some of the API's in rustls-ffi changed so I'm working through that.
 
 https://github.com/rustls/rustls-ffi/issues/159
 https://github.com/rustls/rustls-ffi/issues/161
+https://github.com/rustls/rustls-ffi/issues/163
+https://stackoverflow.com/q/69775381/329700
 
 ### October 28, 2021
 
